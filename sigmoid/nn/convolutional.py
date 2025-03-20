@@ -1,571 +1,244 @@
-""" convolutional.py
-
-Module containing implementations of convolutional neural network
-models in PyTorch.
+""" Contains blocks to build convolutional backbones.
 """
-import math
-
+from math import exp
 import torch
-from torch import nn
-from torch import Tensor
-
-from sigmoid.nn.base import Base
-from sigmoid.nn.utils import conv1d_output_size
-from sigmoid.nn.utils import conv1d_transposed_output_size
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-def round_value(value, scale):
-    """ Returns nearest scaled value.
-    """
-    return int(math.ceil(value * scale))
+class CBAM1D(nn.Module):
+
+    def __init__(self, n_channels_in, reduction_ratio, kernel_size):
+        super(CBAM1D, self).__init__()
+        self.n_channels_in = n_channels_in
+        self.reduction_ratio = reduction_ratio
+        self.kernel_size = kernel_size
+
+        self.channel_attention = ChannelAttention1D(n_channels_in, reduction_ratio)
+        self.spatial_attention = SpatialAttention1D(kernel_size)
+
+    def forward(self, f):
+        chan_att = self.channel_attention(f)
+        # print(chan_att.size())
+        fp = chan_att * f
+        # print(fp.size())
+        spat_att = self.spatial_attention(fp)
+        # print(spat_att.size())
+        fpp = spat_att * fp
+        # print(fpp.size())
+        return fpp
 
 
-class ConvBnRelu(Base):
-    """ Basic block for batch normalized 1D convolution
-        with LeakyReLU activation.
-    """
-    def __init__(self,
-                 in_channel: int, in_width: int,
-                 out_channel: int,
-                 kernel_size: int, stride: int = 1):
-        """ Initializer.
+class SpatialAttention1D(nn.Module):
+    def __init__(self, kernel_size):
+        super(SpatialAttention1D, self).__init__()
+        self.kernel_size = kernel_size
 
-            Creates a single convolutional layer with batch normalization
-            and LeakyReLU activation. Expects the input to be 1D in format
-            (batch_size, in_channels, in_width).
-
-            @param in_channel: int
-                number of input channels (filters)
-            @param in_width: int
-                number of features.
-            @param out_channel: int
-                number of output channels (filters)
-            @kernel_size: int
-                size of the kernel used in the convolutional layer.
-            @param stride: int (defaults to 1)
-                stride of kernel windowing.
-        """
-        self.pad_size_ = kernel_size // 2
-        self.kernel_size_ = kernel_size
-        self.stride_ = stride
-        out_c, out_l = conv1d_output_size(
-            (in_channel, in_width), out_channel,
-            padding=self.pad_size_,
-            kernel_size=self.kernel_size_,
-            stride=self.stride_)
-
-        super(ConvBnRelu, self).__init__(
-            (in_channel, in_width), (out_channel, out_l),
-            "conv_bn_relu")
-
-        self.layerinfo_['conv'] = {
-            'input_c': in_channel,
-            'input_h': 1,
-            'input_w': in_width,
-            'output_c': out_c,
-            'output_h': 1,
-            'output_w': 1,
-        }
-
-    def build(self) -> None:
-        """ Builds convolutonal layer.
-        """
-        conv_params = self.layerinfo_['conv']
-        self.layers_['conv'] = nn.Conv1d(
-            conv_params.get('input_c'),
-            conv_params.get('output_c'),
-            kernel_size=self.kernel_size_,
-            padding=self.pad_size_,
-            stride=self.stride_
+        assert kernel_size % 2 == 1, "Odd kernel size required"
+        # self.conv = nn.Conv2d(in_channels = 2, out_channels = 1, kernel_size = kernel_size, padding= int((kernel_size-1)/2))
+        self.conv = nn.Conv1d(
+            in_channels = 2,
+            out_channels = 1,
+            kernel_size = kernel_size,
+            padding= int((kernel_size-1)/2)
         )
-        self.layers_['batch_normalization'] = \
-            nn.BatchNorm1d(conv_params.get('output_c'))
-        self.layers_['activation'] = nn.LeakyReLU()
+        # batchnorm
 
-        self.model_ = nn.Sequential(self.layers_)
+    def forward(self, x):
+        max_pool = self.agg_channel(x, "max")
+        avg_pool = self.agg_channel(x, "avg")
+        pool = torch.cat([max_pool, avg_pool], dim = 1)
+        conv = self.conv(pool)
+        # batchnorm ????????????????????????????????????????????
+        conv = conv.repeat(1,x.size()[1],1)
+        att = torch.sigmoid(conv)
+        return att
 
-        n = 0
-        for p in self.model_.parameters():
-            if p.requires_grad:
-                n_n = 1
-                for s in list(p.size()):
-                    n_n = n_n * s
-                n += n_n
-            else:
-                continue
+    def agg_channel(self, x, pool = "max"):
+        b,c,h = x.size()
+        x = x.view(b, c, h)
+        x = x.permute(0,2,1)
+        if pool == "max":
+            x = F.max_pool1d(x,c)
+        elif pool == "avg":
+            x = F.avg_pool1d(x,c)
+        x = x.permute(0,2,1)
+        x = x.view(b,1,h)
 
-        self.n_params_ = n
-
-
-class TransposedConvBnRelu(Base):
-    """ Basic block for batch normalized 1D transposed
-        convolution with ReLU activation.
-    """
-    def __init__(self,
-                 in_channel: int, in_width: int,
-                 out_channel: int,
-                 kernel_size: int, dilation: int = 1):
-        """ Initializer.
-
-            Creates a single transposed convolutional layer with batch
-            normalization and LeakyReLU activation. Expects the input to
-            be 1D in format (batch_size, in_channels, in_width).
-
-            @param in_channel: int
-                number of input channels (filters)
-            @param in_width: int
-                number of features.
-            @param out_channel: int
-                number of output channels (filters)
-            @kernel_size: int
-                size of the kernel used in the convolutional layer.
-            @param dilation: int (defaults to 1)
-                dilation used in kernel windowing.
-        """
-        self.pad_size_ = kernel_size // 2
-        self.kernel_size_ = kernel_size
-        self.dilation_ = dilation
-
-        out_c, out_l = conv1d_transposed_output_size(
-            (in_channel, in_width), out_channel,
-            padding=self.pad_size_,
-            kernel_size=self.kernel_size_,
-            stride=1,
-            dilation=self.dilation_)
-        super(TransposedConvBnRelu, self).__init__(
-            (in_channel, in_width), (out_channel, out_l),
-            "transposed_conv_bn_relu")
-
-        self.layerinfo_['transposed_conv'] = {
-            'input_c': in_channel,
-            'input_h': 1,
-            'input_w': in_width,
-            'output_c': out_c,
-            'output_h': 1,
-            'output_w': out_l
-        }
-
-    def build(self) -> None:
-        """ Builds convolutonal layer.
-        """
-        conv_params = self.layerinfo_['transposed_conv']
-        self.layers_['transposed_conv'] = nn.ConvTranspose1d(
-            conv_params.get('input_c'),
-            conv_params.get('output_c'),
-            kernel_size=self.kernel_size_,
-            padding=self.pad_size_,
-            stride=1,
-            dilation=self.dilation_
-        )
-        self.layers_['batch_normalization'] = \
-            nn.BatchNorm1d(conv_params.get('output_c'))
-        self.layers_['activation'] = nn.LeakyReLU()
-
-        self.model_ = nn.Sequential(self.layers_)
-
-        n = 0
-        for p in self.model_.parameters():
-            if p.requires_grad:
-                n_n = 1
-                for s in list(p.size()):
-                    n_n = n_n * s
-                n += n_n
-            else:
-                continue
-
-        self.n_params_ = n
+        return x
 
 
-class ResidualConvModule(Base):
-    """ Efficient-Net block with residual connection.
-    """
-    def __init__(self,
-                 in_channel: int, in_width: int,
-                 out_channel: int,
-                 kernel_size, depth_scale, width_scale,
-                 initial=False):
-        """ Initializer.
+class ChannelAttention1D(nn.Module):
+    def __init__(self, n_channels_in, reduction_ratio):
+        super(ChannelAttention1D, self).__init__()
+        self.n_channels_in = n_channels_in
+        self.reduction_ratio = reduction_ratio
+        self.middle_layer_size = int(self.n_channels_in/ float(self.reduction_ratio))
 
-            Creates a single convolutional block with batch normalization
-            and LeakyReLU activation. Expects the input to be 1D in format
-            (batch_size, in_channels, in_width).
-
-            If in_channel == out_channel then a residual connection is added.
-
-            depth_scale and width_scale control the number of parameters of
-            the block by increasing (decreasing) the number of convolutional
-            layers used (see EfficientNet paper)
-
-            @param in_channel: int
-                number of input channels (filters)
-            @param in_width: int
-                number of features.
-            @param out_channel: int
-                number of output channels (filters)
-            @kernel_size: int
-                size of the kernel used in the convolutional layer.
-            @param depth_scale: float
-                controls the depth (in filter space) of the block
-            @param width_scale: float
-                control the depth (in data space) of the block.
-        """
-        super(ResidualConvModule, self).__init__(
-            (in_channel, in_width), (out_channel, ),
-            'efficient_net_block'
+        self.bottleneck = nn.Sequential(
+            nn.Linear(self.n_channels_in, self.middle_layer_size),
+            nn.ReLU(),
+            nn.Linear(self.middle_layer_size, self.n_channels_in)
         )
 
-        self.kernel_size_ = kernel_size
-        self.depth_ = round_value(2, depth_scale)
-        self.width_scale_ = width_scale
-        self.width_ = round_value(out_channel, width_scale)
-        self.initial_ = initial
-        self.residual_ = in_channel == out_channel
 
-    def build(self):
-        """ Builds single EfficientNet block.
-        """
-        lyr = None
-        info = []
-        if self.initial_:
-            lyr = ConvBnRelu(
-                self.in_[0], self.in_[1],
-                self.width_,
-                self.kernel_size_,
-                stride=2)
-        else:
-            lyr = ConvBnRelu(
-                round_value(self.in_[0], self.width_scale_), self.in_[1],
-                self.width_,
-                self.kernel_size_,
-                stride=2)
-        lyr.build()
-        self.n_params_ += lyr.get_nparams()
-        inf = lyr.get_layer_info()
-        info.append(inf[next(reversed(inf))])
-        self.layerinfo_['conv_bn_relu_in'] = info[-1]
-        self.layers_['in'] = lyr
+    def forward(self, x):
+        kernel = (x.size()[2],)
+        avg_pool = F.avg_pool1d(x, kernel)
+        max_pool = F.max_pool1d(x, kernel)
 
-        for b_id in range(self.depth_ - 1):
-            linfo = info[-1]
-            lyr = ConvBnRelu(linfo['output_c'], linfo['output_w'],
-                             self.width_,
-                             self.kernel_size_)
-            lyr.build()
-            self.n_params_ += lyr.get_nparams()
-            inf = lyr.get_layer_info()
-            info.append(inf[next(reversed(inf))])
-            self.layerinfo_[f'conv_bn_relu_{b_id}'] = info[-1]
-            self.layers_[f'block_{b_id}'] = lyr
+        avg_pool = avg_pool.view(avg_pool.size()[0], -1)
+        max_pool = max_pool.view(max_pool.size()[0], -1)
 
-        self.model_ = nn.Sequential(self.layers_)
+        avg_pool_bck = self.bottleneck(avg_pool)
+        max_pool_bck = self.bottleneck(max_pool)
 
-    def forward(self, x_in: torch.Tensor) -> torch.Tensor:
-        """ Forward method.
-        """
-        res = x_in
-        y_hat = self.model_(x_in)
-        if self.residual_:
-            y_hat += res
+        pool_sum = avg_pool_bck + max_pool_bck
 
-        return y_hat
+        sig_pool = torch.sigmoid(pool_sum)
+        sig_pool = sig_pool.unsqueeze(2)
+
+        out = sig_pool.repeat(1,1,kernel[0])
+        return out
+
+class SEModule(torch.nn.Module):
+
+    def __init__(self,in_channel, ratio=4):
+
+        super(SEModule, self).__init__()
+        self.avepool = torch.nn.AdaptiveAvgPool1d(1)
+        self.linear1 = torch.nn.Linear(in_channel,in_channel//ratio)
+        self.linear2 = torch.nn.Linear(in_channel//ratio,in_channel)
+        self.Hardsigmoid = torch.nn.Hardsigmoid(inplace=True)
+        self.Relu = torch.nn.ReLU(inplace=True)
+
+    def forward(self,input):
+
+        b,c,_ = input.shape
+        x = self.avepool(input)
+        x = x.view([b,c])
+        x = self.linear1(x)
+        x = self.Relu(x)
+        x = self.linear2(x)
+        x = self.Hardsigmoid(x)
+        x = x.view([b,c,1])
+
+        return input*x
 
 
-class TransposedResidualConvModule(Base):
-    """ Efficient-Net block with inverse residual connection
-        using transposed convolutions.
-    """
-    def __init__(self,
-                 in_channel: int, in_width: int,
-                 out_channel: int,
-                 kernel_size, depth_scale, width_scale,
-                 initial=False):
-        """ Initializer.
+class TransposedMBConvBlock(torch.nn.Module):
 
-            Creates a single transposed convolutional block with batch normalization
-            and LeakyReLU activation. Expects the input to be 1D in format
-            (batch_size, in_channels, in_width).
+    def __init__(self, in_channels, out_channels, expand_ratio, kernel_size, stride, se_ratio=4):
 
-            If in_channel == out_channel then a residual connection is added.
+        super(TransposedMBConvBlock, self).__init__()
+        # Expansion phase
+        expanded_channels = int(in_channels * expand_ratio)
+        self.expand_conv = torch.nn.Conv1d(in_channels, expanded_channels,
+                                            kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = torch.nn.BatchNorm1d(expanded_channels)
+        # Depthwise convolution
+        self.depthwise_conv = torch.nn.ConvTranspose1d(expanded_channels, expanded_channels,
+                                              kernel_size=kernel_size,
+                                              stride=stride,
+                                              padding=kernel_size // 2,
+                                              groups=expanded_channels,
+                                              bias=False)
+        self.bn2 = torch.nn.BatchNorm1d(expanded_channels)
+        # Squeeze and Excitation (SE) phase
+        # self.se = SEModule(shrinked_channels, se_ratio)
+        # Conv. attention
+        self.attn = CBAM1D(expanded_channels, se_ratio, kernel_size)
+        # Linear Bottleneck
+        self.linear_bottleneck = torch.nn.Conv1d(expanded_channels, out_channels,
+                                                 kernel_size=1,
+                                                 stride=1,
+                                                 padding=0,
+                                                 bias=False)
+        self.bn3 = torch.nn.BatchNorm1d(out_channels)
+        # Skip connection if input and output channels are the same and stride is 1
+        self.use_skip_connection = (stride == 1) and (in_channels == out_channels)
+        self.leakyrelu = torch.nn.LeakyReLU(0.02)
 
-            depth_scale and width_scale control the number of parameters of
-            the block by increasing (decreasing) the number of convolutional
-            layers used (see EfficientNet paper)
+    def forward(self, x):
 
-            @param in_channel: int
-                number of input channels (filters)
-            @param in_width: int
-                number of features.
-            @param out_channel: int
-                number of output channels (filters)
-            @kernel_size: int
-                size of the kernel used in the convolutional layer.
-            @param depth_scale: float
-                controls the depth (in filter space) of the block
-            @param width_scale: float
-                control the depth (in data space) of the block.
-        """
-        super(TransposedResidualConvModule, self).__init__(
-            (in_channel, in_width), (out_channel, ),
-            'efficient_net_block_transposed'
-        )
+        identity = x
+        # Expansion phase
+        x = self.leakyrelu(self.bn1(self.expand_conv(x)))
+        # Depthwise convolution phase
+        x = self.leakyrelu(self.bn2(self.depthwise_conv(x)))
+        # print(x.shape)
+        # change Squeeze and Excitation phase to Convolutional Attention
+        # x = self.se(x)
+        x = self.attn(x)
+        # Linear Bottleneck phase
+        x = self.linear_bottleneck(x)
+        x = self.bn3(x) #self.linear_bottleneck(x))
+        # Skip connection
+        if self.use_skip_connection:
+            x = identity + x
 
-        self.kernel_size_ = kernel_size
-        self.depth_ = round_value(2, depth_scale)
-        self.width_scale_ = width_scale
-        self.width_ = round_value(out_channel, width_scale)
-        self.initial_ = initial
-        self.residual_ = in_channel == out_channel
-
-    def build(self):
-        """ Builds block.
-        """
-        self.n_params_ = 0
-        lyr = None
-        info = []
-        if self.initial_:
-            lyr = TransposedConvBnRelu(
-                self.in_[0], self.in_[1],
-                self.width_,
-                kernel_size=self.kernel_size_,
-                dilation=2)
-        else:
-            lyr = TransposedConvBnRelu(
-                round_value(self.in_[0], self.width_scale_), self.in_[1],
-                self.width_,
-                self.kernel_size_,
-                dilation=2)
-        lyr.build()
-        self.n_params_ += lyr.get_nparams()
-        inf = lyr.get_layer_info()
-        info.append(inf[next(reversed(inf))])
-        self.layerinfo_['conv_bn_relu_in'] = info[-1]
-        self.layers_['in'] = lyr
-
-        for b_id in range(self.depth_ - 1):
-            linfo = info[-1]
-            lyr = TransposedConvBnRelu(
-                    linfo['output_c'], linfo['output_w'],
-                    self.width_,
-                    self.kernel_size_)
-            lyr.build()
-            self.n_params_ += lyr.get_nparams()
-            inf = lyr.get_layer_info()
-            info.append(inf[next(reversed(inf))])
-            self.layerinfo_[f'trans_conv_bn_relu_{b_id}'] = info[-1]
-            self.layers_[f'block_{b_id}'] = lyr
-
-        self.model_ = nn.Sequential(self.layers_)
-
-    def forward(self, x_in: torch.Tensor) -> torch.Tensor:
-        """ Forward method.
-
-            Applies residual skip connection if input shape equals
-            output shape.
-        """
-        res = x_in
-        y_hat = self.model_(x_in)
-        if self.residual_:
-            y_hat += res
-
-        return y_hat
+        return x
 
 
-class EfficientBackbone1D(Base):
-    """ Implementation of "a la efficient-net" convolutional
-        backbone for feature extraction.
-    """
-    def __init__(self, input_features, output_features,
-                 kernel_size: int = 3,
-                 alpha: float = 1.0,
-                 beta: float = 1.0,
-                 phi: float = 1.0,
-                 n_filters: int = 128):
-        """ Initializer for EfficientNet-ish backbone.
-        """
-        super(EfficientBackbone1D, self).__init__(
-            (1, input_features),
-            (output_features,),
-            'efficientnet_backbone_1d')
-        # number of filters
-        self.nf_ = n_filters
-        # kernel size for convolution
-        self.ks_ = kernel_size
-        # depth scale
-        self.ds_ = alpha ** phi
-        # width scale
-        self.ws_ = beta ** phi
-        # number of neurons in last channel
-        self.lc_ = round_value(self.nf_, self.ws_)
-        # feature extractor
-        self.fe_ = nn.Sequential
-        self.fc_ = nn.Sequential
-        self.pool_ = nn.Module
+class MBConvBlock(torch.nn.Module):
 
-    def build(self):
-        """ Overloads method to build model.
-        """
-        self.n_params_ = 0
+    def __init__(self, in_channels, out_channels, expand_ratio, kernel_size, stride, se_ratio=4):
 
-        info = []
-        # build initial layer of feature extractor
-        f = 16
-        lyr = ResidualConvModule(
-            self.in_[0], self.in_[1],
-            f,
-            self.ks_, self.ds_, self.ws_,
-            initial=True)
-        lyr.build()
-        self.n_params_ += lyr.get_nparams()
-        lyrinfo = lyr.get_layer_info()
-        infitem = lyrinfo[next(reversed(lyrinfo))]
-        info.append(infitem)
-        self.layerinfo_['res_conv_module'] = info[-1]
-        self.layers_[f'block_{1}_{f}'] = lyr
+        super(MBConvBlock, self).__init__()
+        # Expansion phase
+        expanded_channels = int(in_channels * expand_ratio)
+        self.expand_conv = torch.nn.Conv1d(in_channels, expanded_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = torch.nn.BatchNorm1d(expanded_channels)
+        # Depthwise convolution
+        self.depthwise_conv = torch.nn.Conv1d(expanded_channels, expanded_channels, kernel_size=kernel_size, stride=stride,
+                                        padding=kernel_size // 2, groups=expanded_channels, bias=False)
+        self.bn2 = torch.nn.BatchNorm1d(expanded_channels)
+        # Squeeze and Excitation (SE) phase
+        self.se = SEModule(expanded_channels, se_ratio)
+        # self.attn = CBAM1D(expanded_channels, se_ratio, kernel_size)
+        # Linear Bottleneck
+        self.linear_bottleneck = torch.nn.Conv1d(expanded_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn3 = torch.nn.BatchNorm1d(out_channels)
+        # Skip connection if input and output channels are the same and stride is 1
+        self.use_skip_connection = (stride == 1) and (in_channels == out_channels)
+        self.leakyrelu = torch.nn.LeakyReLU(0.02)
 
-        while f < self.nf_:
-            infitem = info[-1]
-            lyr = ResidualConvModule(
-                infitem['output_c'], infitem['output_w'],
-                infitem['output_c'] * 2,
-                self.ks_, self.ds_, self.ws_,
-                initial=False)
-            lyr.build()
-            self.n_params_ += lyr.get_nparams()
-            lyrinfo = lyr.get_layer_info()
-            infitem = lyrinfo[next(reversed(lyrinfo))]
-            info.append(infitem)
-            self.layerinfo_['res_conv_module'] = info[-1]
-            self.layers_[f'block_{f}_{2 * f}'] = lyr
-            f = f * 2
+    def forward(self, x):
 
-        # lazy average pooling
-        self.layers_['pooling'] = nn.AdaptiveAvgPool1d(1)
-        # flatten along features
-        self.layers_['flatten'] = nn.Flatten(start_dim=1)
-        # fully connected layer
-        self.layers_['fc'] = nn.Linear(self.lc_, self.out_[0])
-        for p in self.layers_['fc'].parameters():
-            if p.requires_grad:
-                self.n_params_ += 1
-        self.layers_['final_activation'] = \
-            self.layerinfo_.get('final_activation', torch.nn.Identity())
+        identity = x
+        # Expansion phase
+        x = self.leakyrelu(self.bn1(self.expand_conv(x)))
+        # Depthwise convolution phase
+        x = self.leakyrelu(self.bn2(self.depthwise_conv(x)))
+        # Squeeze and Excitation phase
+        x = self.se(x)
+        # x = self.attn(x)
+        # Linear Bottleneck phase
+        x = self.bn3(self.linear_bottleneck(x))
 
-        self.model_ = nn.Sequential(self.layers_)
+        # Skip connection
+        if self.use_skip_connection:
+            x = identity + x
 
-    def forward(self, x_in: Tensor) -> torch.Tensor:
-        """ Method to run model on input tensor.
-        """
-        x = x_in[:, None, :]
-        y_hat = self.model_(x)
+        return x
 
-        return y_hat
+def test_CBAM1D():
+    # ca = CBAM()
+    f = torch.FloatTensor([
+        [
+            [1,1,1,1,1], [1,1,1,1,1], [1,1,1,1,1]
+        ]
+    ])
+    print('INPUT SIZE TO CBAM1D:', f.size())
+    # sa = SpatialAttention(kernel_size = 3)
+    # sa(f)
+    cbam = CBAM1D(n_channels_in = f.size()[1], reduction_ratio = 2, kernel_size = 3)
+    fpp = cbam(f)
+    print('OUTPUT SIZE FROM CBAM1D:', fpp.size())
+    print(fpp)
+    # print(f)
+    # print(fp)
 
+if __name__ == "__main__":
 
-class EfficientFrontbone1D(Base):
-    """ Implementation of "a la efficient-net" convolutional
-        backbone for feature extraction.
-
-        The name "front-bone" is a reference to the fact that this
-        network operates in transposed mode.
-    """
-    def __init__(self,
-                 input_channels: int,
-                 output_features: int,
-                 kernel_size: int = 3,
-                 alpha: float = 1.0,
-                 beta: float = 1.0,
-                 phi: float = 1.0,
-                 n_filters: int = 128):
-        """ Initializer for EfficientNet-ish backbone.
-        """
-        super(EfficientFrontbone1D, self).__init__(
-            (input_channels, 1),
-            (output_features,),
-            'efficientnet_frontbone_1d')
-        # number of filters
-        self.nf_ = n_filters
-        # kernel size for convolution
-        self.ks_ = kernel_size
-        # depth scale
-        self.ds_ = alpha ** phi
-        # width scale
-        self.ws_ = beta ** phi
-        # number of neurons in last channel
-        self.lc_ = output_features
-        # feature extractor
-        self.fe_ = nn.Sequential
-        self.fc_ = nn.Sequential
-        self.pool_ = nn.Module
-
-    def build(self):
-        """ Overloads method to build model.
-        """
-        c = self.nf_
-        info = []
-        # build initial layer of feature extractor
-        lyr = TransposedResidualConvModule(
-            self.in_[0], self.in_[1],
-            self.nf_,
-            self.ks_, self.ds_, self.ws_,
-            initial=True)
-        lyr.build()
-        self.n_params_ = lyr.get_nparams()
-        lyrinfo = lyr.get_layer_info()
-        infitem = lyrinfo[next(reversed(lyrinfo))]
-        newinfo = {
-            'input_c': self.in_[0],
-            'input_h': 1,
-            'input_w': self.in_[1],
-            'output_c': self.nf_,
-            'output_h': 1,
-            'output_w': infitem['output_w']
-        }
-        info.append(newinfo)
-        self.layerinfo_['res_conv_module'] = info[-1]
-        self.layers_[f'block_{1}_{c}'] = lyr
-        while c >= 16:
-            infitem = info[-1]
-            lyr = TransposedResidualConvModule(
-                c, infitem['output_w'],
-                c // 2,
-                self.ks_, self.ds_, self.ws_,
-                initial=False)
-            lyr.build()
-            self.n_params_ = lyr.get_nparams()
-            lyrinfo = lyr.get_layer_info()
-            infitem = lyrinfo[next(reversed(lyrinfo))]
-            newinfo = {
-                'input_c': c,
-                'input_h': 1,
-                'input_w': infitem['input_w'],
-                'output_c': c // 2,
-                'output_h': 1,
-                'output_w': infitem['output_w']
-            }
-            info.append(newinfo)
-            self.layerinfo_['res_conv_module'] = info[-1]
-            self.layers_[f'block_{c}_{c // 2}'] = lyr
-            c = c // 2
-
-        # average pooling on channels
-        self.layers_['pooling'] = nn.Conv1d(c, 1, kernel_size=1)
-        # flatten along features
-        self.layers_['flatten'] = nn.Flatten(start_dim=1)
-        # fully connected layer
-        info = self.layerinfo_[next(reversed(self.layerinfo_))]
-        self.layers_['fc'] = nn.Linear(info['output_w'], self.lc_)
-        for p in self.layers_['fc'].parameters():
-            if p.requires_grad:
-                self.n_params_ += 1
-        self.layers_['final_activation'] = \
-            self.layerinfo_.get('final_activation', torch.nn.Identity())
-
-        self.model_ = nn.Sequential(self.layers_)
-
-    def forward(self, x_in: Tensor) -> torch.Tensor:
-        """ Method to run model on input tensor.
-        """
-        x = x_in[:, :, None]
-        y_hat = self.model_(x)
-
-        return y_hat
+    test_CBAM1D()

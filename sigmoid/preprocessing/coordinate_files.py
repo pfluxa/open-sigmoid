@@ -16,6 +16,7 @@ way it is presented to the data loader.
 import os
 import copy
 import json
+from collections import OrderedDict
 
 import h5py
 import numpy
@@ -23,30 +24,263 @@ import pandas
 
 import torch
 
-from torch.utils.data import Dataset as torch_Dataset
-from torch.utils.data import DataLoader as torch_DataLoader
-from torch.utils.data import Subset
+from torch.masked import masked_tensor, as_masked_tensor
 
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import StratifiedShuffleSplit
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 
-from sigmoid.local.preprocessing.metadata import MetaData
-from sigmoid.local.preprocessing.cleaners import ColumnCleaner
-from sigmoid.local.preprocessing.transformations import ColumnTransform
-
-from sigmoid.local.preprocessing.transformations import NormalizeToOneZero
-from sigmoid.local.preprocessing.transformations import CategoricalAsOneHot
+from sigmoid.preprocessing.cleaners import ColumnCleaner
+from sigmoid.preprocessing.transformations import ColumnTransform, CategoricalAsOneHot
 
 
-class LocalCache:
+class MetaData(OrderedDict):
+    """ Object to handle column metadata.
+
+    Implementation of MetaData object for SIGMOID.
+
+    MetaData objects are a critical component of data handling: they
+    store column information in such a way that it can be read/written
+    to/fropm HDF5 files, which is the default format to load data into
+    the machine learning pipeline of SIGMOID.
+
+    MetaData object contain several key attributes:
+
+        - original index of column (as in the raw dataframe)
+        - type of column (numerical, categorical, etc)
+        - length of the transformed column (e.g. for one-hot encoding)
+        - id of associated transformation
+        - transformation arguments and parameters
+
+    This information is represented as numpy.ndarrays which allows for
+    persistent storage within the HDF5 file itself, making the Cache
+    (see coordinate_files.py) a self-contained representation of the data.
+
+    Metadata is stored using the attributes capability of HDF5
+    files, and as such it must be stored as vectorized representation.
+    This implementation takes care of "translating" this vectorized
+    format to a "human readable" representation.
+
+    MetaData inherits from OrderedDict.
+    """
+    def __init__(self, max_buffer_size: int = 4096 * 4):
+        """ Initializer of meta data object.
+
+            @param max_buffer_size: int (defaults to 100)
+                maximum *combined* number of arguments and parameters
+                used by a column transformation routine.
+        """
+        super(MetaData, self).__init__()
+        self.buffer_size_ = max_buffer_size
+        self.pos_col_index_ = 0
+        self.pos_col_type_ = 1
+        self.pos_trafo_col_size_ = 2
+        self.pos_trafo_n_params_ = 3
+        self.pos_trafo_n_args_ = 4
+        self.pos_begin_data_ = 10
+
+    def from_hdf5_attributes(self, attr):
+        """ Loads metadata information from h5py attribute object.
+
+            @param attr: h5py.File.attr instance.
+        """
+        self.update(attr)
+
+    def to_dict(self) -> OrderedDict:
+        """ Returns deep-copy of object as OrderedDict.
+        """
+        return copy.deepcopy(self)
+
+    def get_columns(self):
+        """ Returns available column names.
+        """
+        return list(self.keys())
+
+    def add_column(self,
+                   col_name: str, col_index: int, col_type: str,
+                   col_transform=None):
+        """ Adds column information to metadata object.
+
+            @param col_name: str
+                name of the column being added
+            @param col_index: int
+                position of column in the original representation,
+                usually a pandas.DataFrame.
+            @param col_type: str
+                type of column. Valid types are 'float', 'integer',
+                'categorical', 'binary' and 'datetime'.
+            @param col_transform: ColumnTransformation (defaults to None)
+                instance of a ColumnTransformation object
+        """
+        # arguments passed to column transformation
+        trafo_args = {}
+        # parameters passed to column transformation
+        trafo_params = {}
+        # size of transformed column
+        trafo_size = 1
+        if col_transform is not None:
+            # transformation length
+            trafo_size = col_transform.get_length()
+            # transformation parameters as numpy.ndarray
+            trafo_params = col_transform.get_parameters()
+            # transformation arguments as numpy.ndarray
+            trafo_args = col_transform.get_arguments()
+
+        # buffer to store column information
+        data = [''] * self.buffer_size_
+        data[self.pos_col_index_] = str(col_index)
+        data[self.pos_col_type_] = str(col_type)
+        data[self.pos_trafo_col_size_] = str(trafo_size)
+        data[self.pos_trafo_n_params_] = str(len(trafo_params))
+        data[self.pos_trafo_n_args_] = str(len(trafo_args))
+
+        # store transformation arguments
+        offset = self.pos_begin_data_
+        offset += 1
+        for arg_name, arg_data in trafo_args.items():
+            data[offset] = str(len(arg_name))
+            offset += 1
+            data[offset] = str(len(arg_data))
+            offset += 1
+            for c in arg_name:
+                data[offset] = str(c)
+                offset += 1
+            for d in arg_data:
+                if type(d) == str:
+                    data[offset] = d
+                else:
+                    data[offset] = "{:.6f}".format(float(arg_data))
+                offset += 1
+        # store transformation parameters
+        for param_name, param_data in trafo_params.items():
+            param_size = len(param_data)
+            data[offset] = str(len(param_name))
+            offset += 1
+            data[offset] = str(len(param_data))
+            offset += 1
+            for c in param_name:
+                data[offset] = str(c)
+                offset += 1
+            for i in range(param_size):
+                data[offset] = str(param_data[i])
+                offset += 1
+        # build buffer
+        bytebuffer = ''
+        for d in data:
+            bytebuffer += d + '\t'
+        # consolidate into OrderedDict as byte-buffer
+        self[col_name] = bytebuffer  #.encode()
+
+    def get_column_index(self, col_name: str):
+        """ Returns index of column.
+        """
+        r = self[col_name].split('\t')[self.pos_col_index_]
+        return int(r)
+
+    def get_column_type(self, col_name: str):
+        """ Returns column type as string.
+        """
+        data = self[col_name].split('\t')
+        r = data[self.pos_col_type_]
+        return r
+
+    def get_transformed_column_length(self, col_name: str):
+        """ Returns column "length".
+
+            Here, length is used to refer to the number of
+            elements in a column. For instance, a categorical
+            column that is encoded has a one-hot vector and has
+            n categories will have a length of n.
+        """
+        r = self[col_name].split('\t')[self.pos_trafo_col_size_]
+        return int(r)
+
+    def get_parameter_data(self, col_name: str, return_offset: bool = False) -> dict:
+        """ Return list with transformation parameter.
+            @param col_name: str
+                name of the column
+            @param return_offset: optional, bool
+                whether to return the offset in the buffer.
+        """
+        data = self[col_name].split('\t')
+        n_param = int(data[self.pos_trafo_n_params_])
+        # get offset to load parameter data
+        args, offset = self.get_argument_data(col_name, return_offset=True)
+        # reconstruct parameters
+        parameters = {}
+        for _ in range(0, n_param):
+            param_name_len = int(data[offset])
+            offset += 1
+            param_size = int(data[offset])
+            offset += 1
+
+            param_chars = []
+            for c in data[offset:offset + param_name_len]:
+                param_chars.append(c)
+                offset += 1
+            param_name = ''.join(param_chars)
+
+            param_data = []
+            for __ in range(param_size):
+                r = None
+                try:
+                    r = float(data[offset])
+                except ValueError:
+                    r = data[offset]
+                param_data.append(r)
+                offset += 1
+            parameters[param_name] = param_data
+
+        if return_offset:
+            return parameters, offset
+        return parameters
+
+    def get_argument_data(self, col_name: str, return_offset: bool = False) -> dict:
+        """ Returns list with transformation arguments.
+        """
+        data = self[col_name].split('\t')
+        offset = self.pos_begin_data_
+        n_args = int(data[self.pos_trafo_n_args_])
+
+        offset += 1
+        arguments = {}
+        for _ in range(0, n_args):
+            arg_name_len = int(data[offset])
+            offset += 1
+            arg_size = int(data[offset])
+            offset += 1
+
+            arg_chars = []
+            for c in data[offset:offset + arg_name_len]:
+                arg_chars.append(c)
+                offset += 1
+            arg_name = ''.join(arg_chars)
+
+            arg_data = []
+            for __ in range(arg_size):
+                r = None
+                try:
+                    r = float(data[offset])
+                except ValueError:
+                    r = data[offset]
+                arg_data.append(r)
+                offset += 1
+            arguments[arg_name] = arg_data
+
+        if return_offset:
+            return arguments, offset
+
+        return arguments
+
+
+class Cache:
     """
     Cache object for non-distributed environments.
     """
 
     def __init__(self, dataframe: pandas.DataFrame,
-                 target: str,
-                 ignore: list) -> None:
+                 target: str = None,
+                 ignore: list = []) -> None:
         """ Initializes cache object.
 
         @param dataframe: pandas.DataFrame
@@ -67,7 +301,8 @@ class LocalCache:
         self.x_meta_data_ = MetaData()
         self.y_meta_data_ = MetaData()
         self.trafos_ = {}
-        self.cleaners_ = {}
+        self.col_trafos_ = {}
+        # self.cleaners_ = {}
         self.col_types_ = {}
         self.train_splits_ = []
         self.test_splits_ = []
@@ -85,14 +320,13 @@ class LocalCache:
         column_type_info = {}
         with open(path, 'r', encoding='utf-8') as f:
             column_type_info = json.load(f)
-
-        for col_name, info in column_type_info.items():
-            self.col_types_[col_name] = info['type']
+        for col_name, col_type in column_type_info.items():
+            self.col_types_[col_name] = col_type
 
     def attach_type_transformation(self,
                                    apply_to_type: str,
                                    trafo: ColumnTransform,
-                                   cleaner: ColumnCleaner,
+                                   # cleaner: ColumnCleaner,
                                    **trafo_args) -> None:
         """ Set transform for specified data type.
 
@@ -107,15 +341,15 @@ class LocalCache:
         """
         for colname, coltype in self.col_types_.items():
             # ignore forced transformations
-            if colname in self.trafos_:
+            if colname in self.col_trafos_:
                 continue
             if coltype == apply_to_type:
                 self.trafos_[colname] = trafo(**trafo_args)
-                self.cleaners_[colname] = cleaner()
+               #  self.cleaners_[colname] = cleaner()
 
     def attach_column_transformation(self, apply_to_col: str,
                                      trafo: ColumnTransform,
-                                     cleaner: ColumnCleaner,
+                                     # cleaner: ColumnCleaner,
                                      **trafo_args) -> None:
         """ Set transform for specified column.
 
@@ -132,8 +366,8 @@ class LocalCache:
         """
         for colname in self.col_types_:
             if colname == apply_to_col:
-                self.trafos_[colname] = trafo(**trafo_args)
-                self.cleaners_[colname] = cleaner()
+                self.col_trafos_[colname] = trafo(**trafo_args)
+                # self.cleaners_[colname] = cleaner()
 
     def get_column_transform(self, col_name: str) -> ColumnTransform:
         """ Returns transformation associated to a column.
@@ -163,19 +397,26 @@ class LocalCache:
         trafo_dataframes = []
         for col_name in self.data_.columns:
             col_data = self.data_[col_name]
-            if col_name in self.trafos_:
-                # clean
-                col_data = self.cleaners_[col_name](col_data)
+            if col_name in self.col_trafos_:
+                # cleaning step is left for future implementations
+                # col_data = self.cleaners_[col_name](col_data)
+                # transform
+                col_data = self.col_trafos_[col_name](col_data)
+            elif col_name in self.trafos_:
+                # cleaning step is left for future implementations
+                # col_data = self.cleaners_[col_name](col_data)
                 # transform
                 col_data = self.trafos_[col_name](col_data)
             trafo_dataframes.append(col_data)
 
         trafo_data = pandas.concat(trafo_dataframes, axis=1)
 
-        y_cols = [c for c in trafo_data.columns if c.startswith(self.target_)]
-
-        self.y_data_ = trafo_data.filter(regex=f"^{self.target_}_.*")
-        self.x_data_ = trafo_data.drop(y_cols, axis=1)
+        if self.target_ is not None:
+            y_cols = [c for c in trafo_data.columns if c.startswith(self.target_)]
+            self.y_data_ = trafo_data.filter(regex=f"^{self.target_}_.*")
+            self.x_data_ = trafo_data.drop(y_cols, axis=1)
+        else:
+            self.x_data_ = trafo_data
 
     def populate_metadata(self) -> None:
         """ Writes column information to internal MetaData object.
@@ -186,25 +427,30 @@ class LocalCache:
         # input meta-data
         running_index = 0
         for col_name in self.data_.columns:
-            if col_name == self.target_:
-                continue
+            if self.target_ is not None:
+                if col_name == self.target_:
+                    continue
             # get basic column information
             coltype = self.col_types_[col_name]
             # get column transformation (None is valid)
+            coltrafo = self.col_trafos_.get(col_name, None)
             coltrafo = self.trafos_.get(col_name, None)
             self.x_meta_data_.add_column(col_name,
                                          running_index,
                                          coltype, coltrafo)
             running_index += 1
         # output (target) meta-data
-        coltype = self.col_types_[self.target_]
-        coltrafo = self.trafos_.get(self.target_, None)
-        self.y_meta_data_.add_column(self.target_, 0, coltype, coltrafo)
+        if self.target_ is not None:
+            coltype = self.col_types_[self.target_]
+            coltrafo = self.col_trafos_.get(self.target_, None)
+            coltrafo = self.trafos_.get(self.target_, None)
+            self.y_meta_data_.add_column(self.target_, 0, coltype, coltrafo)
 
     def build_splits(self,
                      splits: list = [{'global_fraction': 1.0,
                                       'val_fraction': 0.2}],
-                     random_state: int = 42) -> None:
+                     random_state: int = 42,
+                     stratified: bool = False) -> None:
         """ Performs stratified splitting of the data.
 
             @param splits: list of dictionaries
@@ -226,41 +472,8 @@ class LocalCache:
             categorical and binary targets. For numerical targets, uniform
             sampling is used.
         """
-        X = self.x_data_
-        Y = self.y_data_
-        target = self.y_meta_data_.get_columns()[0]
-        target_type = self.y_meta_data_.get_column_type(target)
-        if target_type == 'categorical':
-            for split_info in splits:
-                val_fraction = split_info.get('val_fraction', 0.2)
-                global_fraction = split_info.get('global_fraction', 1.0)
-
-                idx_cutoff = int(len(X) * global_fraction)
-                Xs = X[:idx_cutoff]
-                Ys = Y[:idx_cutoff]
-
-                msss = \
-                    MultilabelStratifiedShuffleSplit(n_splits=1,
-                                                     test_size=val_fraction,
-                                                     random_state=random_state)
-                for train_index, test_index in msss.split(Xs, Ys):
-                    self.train_splits_.append(train_index)
-                    self.test_splits_.append(test_index)
-        elif target_type == 'binary':
-            for split_info in splits:
-                val_fraction = split_info.get('val_fraction', 0.2)
-                global_fraction = split_info.get('global_fraction', 1.0)
-
-                idx_cutoff = int(len(X) * global_fraction)
-                Xs = X[:idx_cutoff]
-                Ys = Y[:idx_cutoff]
-                mss = StratifiedShuffleSplit(n_splits=1,
-                                             test_size=val_fraction,
-                                             random_state=random_state)
-                for train_index, test_index in mss.split(Xs, Ys):
-                    self.train_splits_.append(train_index)
-                    self.test_splits_.append(test_index)
-        else:
+        if self.target_ is None or (not stratified):
+            X = self.x_data_
             for split_info in splits:
                 val_fraction = split_info.get('val_fraction', 0.2)
                 global_fraction = split_info.get('global_fraction', 1.0)
@@ -269,9 +482,31 @@ class LocalCache:
                 train_index, test_index = train_test_split(
                                             idx,
                                             test_size=val_fraction,
+                                            shuffle=True,
                                             random_state=random_state)
                 self.train_splits_.append(train_index)
                 self.test_splits_.append(test_index)
+        else: 
+            X = self.x_data_
+            Y = self.y_data_
+            target = self.y_meta_data_.get_columns()[0]
+            target_type = self.y_meta_data_.get_column_type(target)
+            if target_type == 'categorical' and stratified:
+                for split_info in splits:
+                    val_fraction = split_info.get('val_fraction', 0.2)
+                    global_fraction = split_info.get('global_fraction', 1.0)
+
+                    idx_cutoff = int(len(X) * global_fraction)
+                    Xs = X[:idx_cutoff]
+                    Ys = Y[:idx_cutoff]
+
+                    msss = \
+                        MultilabelStratifiedShuffleSplit(n_splits=1,
+                                                        test_size=val_fraction,
+                                                        random_state=random_state)
+                    for train_index, test_index in msss.split(Xs, Ys):
+                        self.train_splits_.append(train_index)
+                        self.test_splits_.append(test_index)
 
     def to_hdf5(self, path: str) -> None:
         """ Writes data to HDF5 file.
@@ -287,17 +522,18 @@ class LocalCache:
             as well.
         """
         if os.path.isfile(path):
-            h5file = h5py.File(path, mode='r')
+            h5file = h5py.File(path, mode='r', libver='latest')
             h5file.close()
         h5file = h5py.File(path, mode='w')
         # write raw data
         x_data = self.x_data_.values
-        y_data = self.y_data_.values
         h5file.create_dataset('x', x_data.shape, data=x_data, track_order=True)
-        h5file.create_dataset('y', y_data.shape, data=y_data, track_order=True)
+        if self.target_ is not None:
+            y_data = self.y_data_.values
+            h5file.create_dataset('y', y_data.shape, data=y_data, track_order=True)
+            h5file['y'].attrs.update(self.y_meta_data_)
         # write meta-data
         h5file['x'].attrs.update(self.x_meta_data_)
-        h5file['y'].attrs.update(self.y_meta_data_)
         # write splits
         i = 0
         for train_idx, test_idx in zip(self.train_splits_, self.test_splits_):
@@ -311,7 +547,7 @@ class LocalCache:
         h5file.close()
 
     @classmethod
-    def from_hdf5(cls, path: str):
+    def from_hdf5(cls, path: str, has_target: bool = True):
         """ Reads cache from HDF5 file.
 
             Internal dataframe reference is lost when loading a cache from
@@ -324,336 +560,51 @@ class LocalCache:
         h5file = h5py.File(path, mode='r', swmr=True)
         # instantiate dummy cache
         self = cls(pandas.DataFrame(), 'unknown', ignore=[])
-        # write raw data
-        self.x_data_ = h5file['x']
-        self.y_data_ = h5file['y']
         # read meta-data
         self.x_meta_data_.from_hdf5_attributes(h5file['x'].attrs)
-        self.y_meta_data_.from_hdf5_attributes(h5file['y'].attrs)
-        # recover target name
-        self.target_ = next(iter(self.y_meta_data_))
+        if has_target:
+            self.y_meta_data_.from_hdf5_attributes(h5file['y'].attrs)
+            # recover target name
+            self.target_ = next(iter(self.y_meta_data_))
         # read splits
         n_splits = int(h5file.attrs['n_splits'][0])
         for i in range(n_splits):
             self.train_splits_.append(h5file[f'train_split_{i}'])
             self.test_splits_.append(h5file[f'test_split_{i}'])
+        # read data
+        self.data_ = None
+        x_data = h5file['x']
+        if has_target:
+            y_data = h5file['y']
         # load transformations applied to input data
         for col_name in self.x_meta_data_:
+            idx = self.x_meta_data_.get_column_index(col_name)
             trafo_args = self.x_meta_data_.get_argument_data(col_name)
-            trafo_params = self.x_meta_data_.get_parameter_data(col_name)
-            trafo_name = ''.join(trafo_args['name'])
-            # TODO: calling `eval` is dangerous. This must be changed
-            #       by a safer method!
-            trafo = eval(f'{trafo_name}()')
-            trafo.from_metadata(trafo_args, trafo_params)
-            #for arg_name, arg_value in trafo_args.items():
-            #    trafo.set_argument(arg_name, arg_value)
-            # for param_name, param_value in trafo_params.items():
-            #     trafo.set_parameter(param_name, param_value)
-            self.trafos_[col_name] = trafo
-        # load transformations applied to target data
-        for col_name in self.y_meta_data_:
-            trafo_args = self.y_meta_data_.get_argument_data(col_name)
-            trafo_params = self.y_meta_data_.get_parameter_data(col_name)
-            trafo_name = ''.join(trafo_args['name'])
-            # TODO: calling `eval` is dangerous. This must be changed
-            #       by a safer method!
-            trafo = eval(f'{trafo_name}()')
-            trafo.from_metadata(trafo_args, trafo_params)
-            # for arg_name, arg_value in trafo_args.items():
-            #     trafo.set_argument(arg_name, arg_value)
-            # for param_name, param_value in trafo_params.items():
-            #     trafo.set_parameter(param_name, param_value)
-            self.trafos_[col_name] = trafo
+            if len(trafo_args) > 0:
+                trafo_params = self.x_meta_data_.get_parameter_data(col_name)
+                trafo_name = ''.join(trafo_args['name'])
+                # TODO: calling `eval` is dangerous. This must be changed
+                #       by a safer method!
+                trafo = eval(f'{trafo_name}()')
+                trafo.from_metadata(trafo_args, trafo_params)
+                self.trafos_[col_name] = trafo
+            x_data[col_name] = h5file['x'][()][idx, :]
+        if has_target:
+            # load transformations applied to target data
+            for col_name in self.y_meta_data_:
+                idx = self.x_meta_data_.get_column_index(col_name)
+                trafo_args = self.y_meta_data_.get_argument_data(col_name)
+                if len(trafo_args) > 0:
+                    trafo_params = self.y_meta_data_.get_parameter_data(col_name)
+                    trafo_name = ''.join(trafo_args['name'])
+                    # TODO: calling `eval` is dangerous. This must be changed
+                    #       by a safer method!
+                    trafo = eval(f'{trafo_name}()')
+                    trafo.from_metadata(trafo_args, trafo_params)
+                    self.trafos_[col_name] = trafo
+            y_data[col_name] = h5file['x'][()][idx, :]
+
+        self.x_data_ = x_data
+        self.y_data_ = y_data
 
         return self
-
-
-class LocalDataset(torch_Dataset):
-    """ Wrapper around torch.utils.data.Dataset to read Cache files.
-
-        This particular object handles LocalCache objects, i.e.,
-        works for non-distributed environments.
-
-        `LocalDataset` can be thought as a DataFrame with some added
-        functionality to keep track of column types. This is needed
-        by `sigmoid` in the essenziehen step. The most important
-        functionality is that it "knows" which columns correspond
-        to a given type. Supported types are
-
-        - numerical
-        - categorical (as one-hot encoded vectors)
-        - binary (zero and ones)
-        - datetime (encoded as trigonometric series)
-    """
-    def __init__(self, path: str) -> None:
-        """ Initializer for `LocalDataset`.
-
-            @param path: str
-                system path to HDF5 file with data.
-        """
-        self.binary_ = []
-        self.categorical_ = []
-        self.numerical_ = []
-        self.datetime_ = []
-
-        # swmr = True allows multiple workers to read from the same file
-        # concurrently. handy!
-        self.h5file_ = h5py.File(path, 'r', swmr=True)
-        # use meta data to tell which columns are for training and
-        # which columns are for target
-        self.x_meta_data_ = MetaData()
-        self.y_meta_data_ = MetaData()
-
-        self.x_meta_data_.from_hdf5_attributes(self.h5file_['x'].attrs)
-        self.y_meta_data_.from_hdf5_attributes(self.h5file_['y'].attrs)
-
-        # assemble column ranges for different input types
-        offset = 0
-        for col_name in self.x_meta_data_.get_columns():
-            idx = self.x_meta_data_.get_column_index(col_name)
-            size = self.x_meta_data_.get_transformed_column_length(col_name)
-            col_type = self.x_meta_data_.get_column_type(col_name)
-            col_range = numpy.arange(idx + offset,
-                                     idx + offset + size,
-                                     dtype=int)
-            col_range = col_range.tolist()
-            offset += size - 1
-            # assign column types
-            if col_type == 'binary':
-                self.binary_.append(col_range)
-            elif col_type == 'categorical':
-                self.categorical_.append(col_range)
-            elif col_type == 'datetime':
-                self.datetime_.append(col_range)
-            # the rest is numerical
-            else:
-                self.numerical_.append(col_range)
-
-        self.x_data_ = numpy.asarray(self.h5file_['x'][:])
-        self.y_data_ = numpy.asarray(self.h5file_['y'][:])
-
-        self.n_rows_ = self.x_data_.shape[0]
-        self.n_input_ = self.x_data_.shape[1]
-        self.n_output_ = self.y_data_.shape[1]
-
-    def get_input_dim(self) -> int:
-        """ Returns number of features in X data.
-        """
-        return self.n_input_
-
-    def get_output_dim(self) -> int:
-        """ Returns number of features in Y data.
-        """
-        return self.n_output_
-
-    def get_input_metadata(self) -> MetaData:
-        """ Returns reference to internal metadata of X.
-        """
-        return self.x_meta_data_
-
-    def get_output_metadata(self) -> MetaData:
-        """ Returns reference to internal metadata of Y.
-        """
-        return self.y_meta_data_
-
-    def get_input_categorical_columns(self) -> list:
-        """ Returns list of column ranges with one-hot encoded data.
-        """
-        in_onehot = copy.copy(self.categorical_)
-
-        return in_onehot
-
-    def get_input_binary_columns(self) -> list:
-        """ Returns list of column ranges with binary data.
-        """
-        return self.binary_
-
-    def get_input_numerical_columns(self) -> list:
-        """ Returns list of column ranges with numerical data.
-        """
-        return self.numerical_
-
-    def get_input_datetime_columns(self) -> list:
-        """ Returns list of column ranges with datetime data
-        """
-        return self.datetime_
-
-    def get_input_class_weights(self) -> list:
-        """ Returns list of numpy.ndarray with relative class weights.
-
-            Weights are calculated as normalized relative frequencies
-            of occurrences. It is assumed that the transformation that
-            encoded categories has a 'class_weights' parameter.
-'
-            @raises: ValueError if transformation does not have a
-            parameter called 'class_weights'.
-        """
-        weights = []
-        for col_name in self.x_meta_data_.get_columns():
-            col_type = self.x_meta_data_.get_column_type(col_name)
-            if col_type == 'categorical':
-                p = self.x_meta_data_.get_parameter_data(col_name)
-                if 'class_weights' not in p:
-                    raise ValueError(
-                        "Transformation needs 'class_weights' parameter.")
-                w = p['class_weights']
-                w = numpy.asarray(w).ravel()
-                w = w / numpy.sum(w)
-                weights.append(w)
-
-        return weights
-
-    def get_output_class_weights(self) -> list:
-        """ Returns list of numpy.ndarray with relative class weights
-            for the target variable.
-
-            Weights are calculated as normalized relative frequencies
-            of occurrences. It is assumed that the transformation that
-            encoded categories has a 'class_weights' parameter.
-'
-            @raises: ValueError if transformation does not have a
-            parameter called 'class_weights'.
-        """
-        weights = []
-        for col_name in self.y_meta_data_.get_columns():
-            col_type = self.y_meta_data_.get_column_type(col_name)
-            if col_type == 'categorical':
-                p = self.y_meta_data_.get_parameter_data(col_name)
-                if 'class_weights' not in p:
-                    raise ValueError(
-                        "Transformation needs 'class_weights' parameter.")
-                w = p['class_weights']
-                w = numpy.asarray(w).ravel()
-                w = w / numpy.sum(w)
-                weights.append(w)
-
-        return weights
-
-    def get_train_split(self, split_id: int = 0) -> numpy.ndarray:
-        """ Returns training split
-        """
-        split = self.h5file_[f'train_split_{split_id}'][:]
-
-        return split
-
-    def get_test_split(self, split_id: int = 0) -> numpy.ndarray:
-        """ Returns training split
-        """
-        split = self.h5file_[f'test_split_{split_id}'][:]
-
-        return split
-
-    def __len__(self):
-        """ Returns number of rows in dataset.
-        """
-        return self.n_rows_
-
-    def __getitem__(self, index):
-        """ Returns tensors X and Y.
-        """
-        x = numpy.atleast_1d(self.x_data_)[index]
-        y = numpy.atleast_1d(self.y_data_)[index]
-
-        X = torch.tensor(x, dtype=torch.float32)
-        Y = torch.tensor(y, dtype=torch.float32)
-
-        return X, Y
-
-
-class LocalLoader(torch_DataLoader):
-    """ Wrapper around torch.utils.data.DataLoader with
-        support for distributed data loading.
-    """
-
-    def __init__(self, dataset: LocalDataset) -> None:
-        """ Initializer.
-
-            @param dataset: LocalDataset
-                An instance of LocalDataset.
-        """
-        super(LocalLoader, self).__init__(dataset)
-
-        self.dataset_ = dataset
-        self.train_set_ = torch_Dataset
-        self.test_set_ = torch_Dataset
-        self.train_loader_ = torch_DataLoader
-        self.test_loader_ = torch_DataLoader
-
-        self.test_fraction_ = 0
-
-        self.train_batch_size_ = 0
-        self.test_batch_size_ = 0
-        self.num_workers_ = 0
-        # use persistence workers by default
-        self.persistent_workers_ = True
-
-    def get_train_loader(self,
-                         split_id: int,
-                         batch_size: int, num_workers: int = 0):
-        """ Returns DataLoader for training.
-
-            @param split_id: integer
-                id of split to load.
-            @param batch_size: integer
-                batch size, passed to `batch_size` when
-                building the `DataLoader`
-            @param num_workers: integer (defaults to 0)
-                number of workers, passed as to `num_workers`
-                when building the `DataLoader`
-        """
-        train_split = self.dataset_.get_train_split(split_id).tolist()
-        train_dataset = Subset(self.dataset_, train_split)
-
-        if self.num_workers_ > 0 and self.num_workers_ is not None:
-            self.train_loader_ = torch_DataLoader(
-                train_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=num_workers,
-                persistent_workers=True,
-                drop_last=True)
-        else:
-            self.train_loader_ = torch_DataLoader(
-                train_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=num_workers,
-                drop_last=True)
-
-        return self.train_loader_
-
-    def get_test_loader(self,
-                        split_id: int,
-                        batch_size: int, num_workers: int = 0):
-        """ Returns DataLoader for training.
-
-            @param split_id: integer
-                id of split to load.
-            @param batch_size: integer
-                batch size, passed to `batch_size` when building
-                the `DataLoader`.
-            @param num_workers: integer (defaults to 0)
-                number of workers, passed as to `num_workers` when
-                building the `DataLoader`.
-        """
-        test_split = self.dataset_.get_test_split(split_id).tolist()
-        test_dataset = Subset(self.dataset_, test_split)
-
-        if self.num_workers_ > 0 and self.num_workers_ is not None:
-            self.test_loader_ = torch_DataLoader(
-                test_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                persistent_workers=True,
-                drop_last=True)
-        else:
-            self.test_loader_ = torch_DataLoader(
-                test_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                drop_last=True)
-
-        return self.test_loader_

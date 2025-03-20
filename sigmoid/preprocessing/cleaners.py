@@ -11,6 +11,9 @@ $456
 is clearly numerical, but the '$' sign will prevent packages
 like `pandas` or `numpy` to properly parse it to a numerical
 representation.
+
+Note: these routines are meant to run in future implementations
+      where a powerful enough type detector exists.
 """
 import pandas
 

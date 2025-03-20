@@ -1,3 +1,6 @@
+# Data folder
+data/
+
 # Poetry
 poetry.lock
 

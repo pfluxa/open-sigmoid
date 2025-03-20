@@ -10,7 +10,7 @@ Available methods are:
 import numpy
 from sklearn.decomposition import PCA
 
-from sigmoid.local.preprocessing.coordinate_files import LocalCache
+from sigmoid.preprocessing.coordinate_files import LocalCache
 
 
 class LocalPCAEstimator:
@@ -19,14 +19,13 @@ class LocalPCAEstimator:
         compute environment.
     """
 
-    def __init__(self, cache: LocalCache):
+    def __init__(self, dataset):
         """ Initializer for PCAEstimator.
 
         @param cache: LocalCache object.
         """
         self.k_comp = -1
-        self.data_ = cache.x_data_
-        print(cache.x_data_.shape)
+        self.data_ = dataset.x_num_data_
         self.estimator_ = PCA(n_components=2)
         self.var_ = {}
 

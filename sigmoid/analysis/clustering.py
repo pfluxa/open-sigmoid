@@ -1,114 +1,175 @@
 import numpy
-
-import hdbscan
+import numpy as np
 
 from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
 
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 
+from hdbscan import HDBSCAN
+# from sklearn.cluster import HDBSCAN
+from sklearn.cluster import AffinityPropagation
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from scipy.spatial import ConvexHull
 
-class HDBSCAN:
-    """ Finds optimal number of clusters using HDBSCAN.
-    """
+class ClusterFinder:
+
     def __init__(self, **kwargs):
-        """ Initializer for optimal clustering.
 
-            :param kwargs (keyword arguments)
-                keyword arguments passed to HDBSCAN.
-        """
-        self.pca_ = PCA(n_components=2)
+        self.n_comp_ = 3
+        self.pca_ = PCA(n_components=self.n_comp_, whiten=True)
         self.scores_ = []
-        self.clusterer_ = hdbscan.HDBSCAN(**kwargs)
+        self.hdbscan_ = HDBSCAN(**kwargs)
+        self.aff_prop_ = AffinityPropagation(verbose=True)
+        self.min_ = 0
+        self.max_ = 0
+        '''
+        --------------------------------
+        arguments for hdbscan
+        --------------------------------
+        min_samples=20,
+        min_cluster_size=50,
+        cluster_selection_method='leaf',
+        cluster_selection_epsilon=0.45,
+        n_jobs=24,
+        metric='euclidean',
+        store_centers='medoid'
+        '''
 
-    def run_clustering(self, data: numpy.ndarray) -> numpy.ndarray:
+    def find_clusters(self, data: numpy.ndarray) -> numpy.ndarray:
         """ Runs HDSCAN on provided data.
 
             :param data (numpy.ndarray)
                 2D array with data.
         """
-        labels = self.clusterer_.fit_predict(data)
+        self.pca_.fit(data)
+        print("variances")
+        for c in range(0, self.n_comp_):
+            print(f"[INFO][clustering::PCA] component {c} explains: {self.pca_.explained_variance_ratio_[c]:1.4f} of variance.")
+        labels = self.hdbscan_.fit_predict(data)
+        # labels = self.aff_prop_.fit_predict(data)
 
         return labels
 
-    def run_subclustering(self,
-                          data: numpy.ndarray, labels: numpy.ndarray,
-                          k: int) -> numpy.ndarray:
-        """ Performs sub-clustering using K-Means.
-
-            :param data (numpy.ndarray)
-                2-D array with data.
-            :param labels (numpy.ndarray)
-                1-D array with data labels (like the output of
-                routing `run_clustering()`)
-            :param k (int)
-                number of sub-clusters to generate.
+    def elbow_kmeans(self, data, maxK=30, seed_centroids=None):
         """
-        kmeans = KMeans(n_clusters=k)
-        new_labels = numpy.zeros_like(labels)
-        for label in numpy.unique(labels):
-            cluster_mask = labels == label
-            cluster_data = data[cluster_mask]
-            cluster_labels = kmeans.fit_predict(cluster_data)
-            new_labels[cluster_mask] = label * k + cluster_labels
-            print(numpy.unique(new_labels))
-
-        return new_labels
+            parameters:
+            - data: pandas DataFrame (data to be fitted)
+            - maxK (default = 10): integer (maximum number of clusters with which to run k-means)
+            - seed_centroids (default = None ): float (initial value of centroids for k-means)
+        """
+        sse = {}
+        for k in list(range(1, maxK)):
+            print("k: ", k)
+            kmeans = KMeans(
+                n_clusters=k,
+                init='random',
+                n_init=100,
+                algorithm='elkan',
+                random_state=0).fit(data)
+                # data["clusters"] = kmeans.labels_
+            # Inertia: Sum of distances of samples to their closest cluster center
+            sse[k] = kmeans.inertia_
+        plt.figure()
+        plt.plot(list(sse.keys()), list(sse.values()))
+        plt.savefig("elbow.png")
 
     def plot_clusters(self,
-                      data: numpy.ndarray, labels: numpy.ndarray):
+                      data: numpy.ndarray, labels: numpy.ndarray,
+                      prefix: str = None):
         """ Plot clusters in 2-D space.
         """
-        twod = self.pca_.fit_transform(data)
-        clustered = labels > -1
-        dmin = min(numpy.min(twod[clustered, 0]),
-                    numpy.min(twod[clustered, 1]))
-        dmax = max(numpy.max(twod[clustered, 0]),
-                    numpy.max(twod[clustered, 1]))
-        plt.clf()
-        plt.scatter(twod[~clustered, 0],
-                    twod[~clustered, 1],
-                    color=(0.5, 0.5, 0.5),
-                    s=0.2,
-                    alpha=0.5)
-        plt.scatter(twod[clustered, 0],
-                    twod[clustered, 1],
-                    c=labels[clustered],
-                    s=0.5,
-                    alpha=0.5,
-                    cmap='rainbow')
-        plt.xlim(dmin, dmax)
-        plt.ylim(dmin, dmax)
-        plt.savefig('clusters.png')
+        X = self.pca_.transform(data)
+        self.min_ = numpy.min(X) / 0.9
+        self.max_ = numpy.max(X) / 0.9
 
+        plt.figure(figsize=(5 * 3, 2 * 5))
+        G = gridspec.GridSpec(2, 3)
+        ax11 = plt.subplot(G[0, 0])
+        ax12 = plt.subplot(G[0, 1])
+        ax13 = plt.subplot(G[0, 2])
 
-if __name__ == '__main__':
+        ax21 = plt.subplot(G[1, 0])
+        ax22 = plt.subplot(G[1, 1])
+        ax23 = plt.subplot(G[1, 2])
 
-    import time
-    from sklearn.datasets import make_blobs
+        info = [
+            {
+            'axis': ax11,
+            'x_dim': 0,
+            'y_dim': 1,
+            'clustered': True,
+            'proj': 'xy'
+            },
+            {
+            'axis': ax12,
+            'x_dim': 0,
+            'y_dim': 2,
+            'clustered': True,
+            'proj': 'xz'
+            },
+            {
+            'axis': ax13,
+            'x_dim': 1,
+            'y_dim': 2,
+            'clustered': True,
+            'proj': 'yz'
+            },
+            {
+            'axis': ax21,
+            'x_dim': 0,
+            'y_dim': 1,
+            'clustered': False,
+            'proj': 'xy'
+            },
+            {
+            'axis': ax22,
+            'x_dim': 0,
+            'y_dim': 2,
+            'clustered': False,
+            'proj': 'xz'
+            },
+            {
+            'axis': ax23,
+            'x_dim': 1,
+            'y_dim': 2,
+            'clustered': False,
+            'proj': 'yz'
+            },
+        ]
+        for plot_info in info:
+            ax = plot_info['axis']
+            ax.set_aspect('equal')
+            x_dim = plot_info['x_dim']
+            y_dim = plot_info['y_dim']
+            is_clustered = plot_info['clustered']
 
-    tic = time.time()
-    x, y = make_blobs(1000000, n_features=2, centers=4, cluster_std=0.3)
-    data_min = min(numpy.min(x[:, 0]), numpy.min(x[:, 1]))
-    data_max = max(numpy.max(x[:, 0]), numpy.max(x[:, 1]))
-    toc = time.time()
-    print(f'elapsed time generating data: {toc - tic:.4f}')
+            if is_clustered:
+                colors = ["g.", "r.", "b.", "y.", "c."]
+                for klass in numpy.unique(labels):
+                    if klass == -1:
+                        continue
+                    color_idx = klass % len(colors)
+                    color = colors[color_idx]
+                    Xk = X[labels == klass]
+                    points = numpy.asarray([Xk[:, x_dim], Xk[:, y_dim]]).T
+                    hull = ConvexHull(points)
+                    for simplex in hull.simplices:
+                        ax.plot(points[simplex, 0], points[simplex, 1], 'k-', lw=0.5, alpha=0.7)
+                    ax.plot(Xk[:, x_dim], Xk[:, y_dim], color, alpha=0.1)
+            else:
+                ax.plot(X[labels == -1, x_dim], X[labels == -1, y_dim], "k+", alpha=0.01)
+            ax.set_xlim(self.min_, self.max_)
+            ax.set_ylim(self.min_, self.max_)
+            if is_clustered:
+                ax.set_title(f"proj = {plot_info['proj']}")
+            else:
+                ax.set_title(f"proj = {plot_info['proj']} (noise)")
 
-    tic = time.time()
-    clusterer = HDBSCAN(min_samples=10)
-    labels_global = clusterer.run_clustering(x)
-     # labels_sub = clusterer.run_subclustering(x, labels_global, 4)
-    toc = time.time()
-    print(f'elapsed time clustering using HDBSCAN: {toc - tic:.4f}')
-    '''
-    fig, axes = plt.subplots(1, 2)
-    # plot with global clusters
-    axes[0].scatter(x[:, 0], x[:, 1], alpha=0.6, s=0.6, cmap='rainbow', c=labels_global)
-    axes[0].set_xlim(data_min, data_max)
-    axes[0].set_ylim(data_min, data_max)
-    # plot with sub-clusters
-    axes[1].scatter(x[:, 0], x[:, 1], alpha=0.6, s=0.6, cmap='rainbow', c=labels_sub)
-    axes[1].set_xlim(data_min, data_max)
-    axes[1].set_ylim(data_min, data_max)
-    plt.show()
-    '''
+        plt.tight_layout()
+        if prefix is not None:
+            plt.savefig(f"{prefix}_analysis.png")
+        else:
+            plt.savefig("analysis.png")

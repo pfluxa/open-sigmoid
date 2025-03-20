@@ -34,8 +34,8 @@ import numpy
 import pandas
 
 from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import QuantileTransformer
 from sklearn.preprocessing import MinMaxScaler
-
 
 class ColumnTransform:
     """ Base class for column transformations.
@@ -52,7 +52,8 @@ class ColumnTransform:
                          'DatetimeAsTrigonometric': 11,
                          'CategoricalAsOrdinal': 20,
                          'CategoricalAsOneHot': 21,
-                         'NumericalNormalize': 31,
+                         'min_max-transform': 31,
+                         'quantile-transform': 32,
                          'BinaryAsZeroOne': 41}
 
     def __init__(self, **kwargs):
@@ -215,14 +216,14 @@ class ColumnTransform:
         raise NotImplementedError("from_metadata not implemented.")
 
 
-class NormalizeToOneZero(ColumnTransform):
+class Passthrough(ColumnTransform):
     """ Normalizes a sequence of numbers to the range [0, 1].
     """
     def __init__(self):
         """ Initializes ColumnTransform with name (required).
         """
-        super(NormalizeToOneZero, self).__init__(
-            name='NormalizeToOneZero')
+        super(Passthrough, self).__init__(
+            name='Passthrough')
         # set length of transformed data to 1 (scalar output)
 
     def forward_transform(self,
@@ -238,17 +239,13 @@ class NormalizeToOneZero(ColumnTransform):
         """
         # transformed column is of length 1
         self.set_length(1)
-        scaler = MinMaxScaler()
         col_name = col_data.name
-        # fit MinMax scaler
         x = col_data.to_numpy().reshape((-1, 1))
-        y1 = scaler.fit_transform(x)
         # create DataFrame to store transformed data.
         transformed = pandas.DataFrame()
-        transformed[f'{col_name}_transformed'] = y1.ravel()
+        transformed[f'{col_name}_transformed'] = x.ravel()
 
-        self.set_parameter('scale', scaler.scale_)
-        self.set_parameter('min', scaler.min_)
+        self.set_parameter('passthrough', numpy.array([1.0]))
 
         return transformed
 
@@ -262,13 +259,179 @@ class NormalizeToOneZero(ColumnTransform):
             :kwargs (keyword arguments)
                 Not used; kept for compatiblity.
         """
-        if 'scale' not in self.params_:
-            raise KeyError("parameter 'scale' is missing.")
-        if 'min' not in self.params_:
-            raise KeyError("parameter 'min' is missing")
+        if 'passthrough' not in self.params_:
+            raise KeyError("parameter 'passthrough' is missing.")
+
+        orig_col = pandas.Series(col_data.ravel())
+
+        return orig_col
+
+    def from_metadata(self, arguments: dict, parameters: dict):
+        """ Loads scaling information from arguments/parameters.
+
+            @param arguments: dict
+                Dictionary with at least a keyword named 'name'
+            @param parameters: dict
+                Dictionary with at least the keywords
+                    - 'scale' (float)
+                    - 'mean' (float)
+                    - 'var' (float, positive number)
+        """
+        if 'name' not in arguments:
+            raise KeyError("'name' argument is missing.")
+        if 'passthrough' not in parameters:
+            raise KeyError("'passthrough' parameter is missing.")
+
+        name = arguments['name']
+        passthrough = parameters['passthrough']
+
+        self.set_argument('name', name)
+        self.set_parameter('passthrough', passthrough)
+
+
+class MinMaxTransform(ColumnTransform):
+    """ Normalizes a sequence of numbers to the range [0, 1].
+    """
+    def __init__(self):
+        """ Initializes ColumnTransform with name (required).
+        """
+        super(MinMaxTransform, self).__init__(
+            name='min_max-transform')
+        # set length of transformed data to 1 (scalar output)
+        self.set_length(1)
+
+    def forward_transform(self,
+                          col_data: pandas.Series,
+                          **kwargs) -> pandas.DataFrame:
+        """ Executes forward transform.
+
+            :param col_data (pandas.Series)
+                pandas.Series containing data to be transformed. Each entry
+                of this sequence must be convertible to `float`.
+            :param kwargs (keyword arguments)
+                Not used, kept for compatibility.
+        """
+        # transformed column is of length 1
         scaler = MinMaxScaler()
+        col_name = col_data.name
+        # fit MinMax scaler
+        x = col_data.to_numpy()
+        x = x.reshape((-1, 1))
+        y1 = scaler.fit_transform(x)
+        
+        # create DataFrame to store transformed data.
+        transformed = pandas.DataFrame()
+        transformed[f'{col_name}_transformed'] = y1.ravel()
+
+        self.set_parameter('min', scaler.min_)
+        self.set_parameter('scale', scaler.scale_)
+        self.set_parameter('n_features_in', [scaler.n_features_in_,])
+
+        return transformed
+
+    def backwards_transform(self,
+                            col_data: pandas.DataFrame,
+                            **kwargs) -> pandas.Series:
+        """ Executes backwards transform.
+
+            :param col_data (pandas.DataFrame)
+                Transformed data.
+            :kwargs (keyword arguments)
+                Not used; kept for compatiblity.
+        """
+        if 'n_features_in' not in self.params_:
+            raise KeyError("parameter 'n_features_in' is missing")
+        
+        scaler = MinMaxScaler()
+        scaler.n_features_in_ = self.params_['n_features_in']
         scaler.scale_ = self.params_['scale']
         scaler.min_ = self.params_['min']
+
+        orig_col_data = scaler.inverse_transform(
+            col_data.values.reshape((-1, 1)))
+
+        orig_col = pandas.Series(orig_col_data.ravel())
+
+        return orig_col
+
+    def from_metadata(self, arguments: dict, parameters: dict):
+        """ Loads scaling information from arguments/parameters.
+        """
+        if 'name' not in arguments:
+            raise KeyError("'name' argument is missing.")
+        if 'n_features_in' not in parameters:
+            raise KeyError("'n_features_in' parameter is missing")
+
+        name = arguments['name']
+        min_ = parameters['min']
+        scale_ = parameters['scale']
+        n_features_in_ = parameters['n_features_in'][0]
+
+        self.set_argument('name', name)
+        self.set_parameter('min', min_)
+        self.set_parameter('scale', scale_)
+        self.set_parameter('n_features_in', n_features_in_)
+
+
+class QuantileTransform(ColumnTransform):
+    """ Normalizes a sequence of numbers to the range [0, 1].
+    """
+    def __init__(self):
+        """ Initializes ColumnTransform with name (required).
+        """
+        super(QuantileTransform, self).__init__(
+            name='quantile-transform')
+        # set length of transformed data to 1 (scalar output)
+        self.set_length(1)
+
+    def forward_transform(self,
+                          col_data: pandas.Series,
+                          **kwargs) -> pandas.DataFrame:
+        """ Executes forward transform.
+
+            :param col_data (pandas.Series)
+                pandas.Series containing data to be transformed. Each entry
+                of this sequence must be convertible to `float`.
+            :param kwargs (keyword arguments)
+                Not used, kept for compatibility.
+        """
+        # transformed column is of length 1
+        scaler = QuantileTransformer()
+        col_name = col_data.name
+        # fit MinMax scaler
+        x = col_data.to_numpy()
+        x = x.reshape((-1, 1))
+        y1 = scaler.fit_transform(x)
+        
+        # create DataFrame to store transformed data.
+        transformed = pandas.DataFrame()
+        transformed[f'{col_name}_transformed'] = y1.ravel()
+
+        self.set_parameter('n_quantiles', [scaler.n_quantiles_,])
+        self.set_parameter('quantiles', scaler.quantiles_)
+        self.set_parameter('references', scaler.references_)
+        self.set_parameter('n_features_in', [scaler.n_features_in_,])
+
+        return transformed
+
+    def backwards_transform(self,
+                            col_data: pandas.DataFrame,
+                            **kwargs) -> pandas.Series:
+        """ Executes backwards transform.
+
+            :param col_data (pandas.DataFrame)
+                Transformed data.
+            :kwargs (keyword arguments)
+                Not used; kept for compatiblity.
+        """
+        if 'n_features_in' not in self.params_:
+            raise KeyError("parameter 'n_features_in' is missing")
+        
+        scaler = QuantileTransformer()
+        scaler.n_quantiles_ = self.params_['n_quantiles']
+        scaler.quantiles_ = self.params_['quantiles']
+        scaler.references_ = self.params_['references']
+        scaler.n_features_in_ = self.params_['n_features_in']
 
         orig_col_data = scaler.inverse_transform(
             col_data.values.reshape((-1, 1)))
@@ -290,18 +453,102 @@ class NormalizeToOneZero(ColumnTransform):
         """
         if 'name' not in arguments:
             raise KeyError("'name' argument is missing.")
-        if 'scale' not in parameters:
-            raise KeyError("'scale' parameter is missing.")
-        if 'min' not in parameters:
-            raise KeyError("'min' parameter is missing")
+        if 'n_features_in' not in parameters:
+            raise KeyError("'n_features_in' parameter is missing")
 
         name = arguments['name']
-        scale = parameters['scale']
-        dmin = parameters['min']
+        n_quantiles = parameters['n_quantiles'][0]
+        quantiles = parameters['quantiles']
+        references = parameters['references']
+        n_features_in = parameters['n_features_in'][0]
 
         self.set_argument('name', name)
-        self.set_parameter('scale', scale)
-        self.set_parameter('min', dmin)
+        self.set_parameter('n_quantiles', n_quantiles)
+        self.set_parameter('quantiles', quantiles)
+        self.set_parameter('references', references)
+        self.set_parameter('n_features_in', n_features_in)
+
+
+class CategoricalAsOrdinal(ColumnTransform):
+    """ Transformation for categorical features.
+    """
+    def __init__(self):
+        """ Initializes transform with name (required).
+        """
+        super(CategoricalAsOrdinal, self).__init__(
+            name='CategoricalAsOrdinal')
+
+    def forward_transform(self,
+                          col_data: pandas.Series,
+                          **kwargs) -> pandas.DataFrame:
+        """ Executes forward transform.
+
+            :param col_data (pandas.Series)
+                pandas.Series containing data to be transformed.
+            :param kwargs (keyword arguments)
+                Not used, kept for compatibility.
+        """
+        col_name = col_data.name
+        lbl_encoder = LabelEncoder()
+        # transform categories into ordinal labels
+        lbl_encoded = lbl_encoder.fit_transform(col_data)
+        # set length of data to 1 (scalar)
+        self.set_length(1)
+        # labels go from 0 to n_categories - 1
+        labels = numpy.asarray(lbl_encoded, dtype=int)
+        # convert to dataframe
+        new_col_name = "{}_ordinal".format(col_name)
+        transformed = pandas.DataFrame(data=labels.reshape((-1, 1)), columns=[new_col_name,])
+        # store original column name
+        self.set_parameter("name", col_name)
+        # store original class names
+        self.set_parameter('class_names', lbl_encoder.classes_)
+
+        return transformed
+
+    def backwards_transform(self,
+                            col_data: pandas.DataFrame,
+                            **kwargs) -> pandas.Series:
+        """ Executes backwards transform.
+
+            :param col_data (pandas.DataFrame)
+                Transformed data.
+            :kwargs (keyword arguments)
+                Not used; kept for compatiblity.
+        """
+        if 'class_names' not in self.params_:
+            raise KeyError("'class_names' parameter is missing.")
+        # create new dataframe with column names = class names
+        class_names = self.params_['class_names']
+        lbl_encoder = LabelEncoder()
+        lbl_encoder.classes_ = class_names 
+        as_df = pandas.DataFrame(
+            index=col_data.index,
+            columns=[self.params_['name'],],
+            data=lbl_encoder.inverse_transform(col_data.to_numpy().reshape((-1, 1)))
+        )
+
+        return as_df
+
+    def from_metadata(self, arguments: dict, parameters: dict):
+        """ Loads scaling information from arguments/parameters.
+
+            @param arguments: dict
+                Dictionary with at least a keyword named 'name'
+            @param parameters: dict
+                Dictionary with at least the keywords
+                    - 'class_names' (float)
+        """
+        if 'name' not in arguments:
+            raise KeyError("'name' argument is missing.")
+        if 'class_names' not in parameters:
+            raise KeyError("'class_names' parameter is missing.")
+
+        name = arguments['name']
+        class_names = parameters['class_names']
+
+        self.set_argument('name', name)
+        self.set_parameter('class_names', class_names)
 
 
 class CategoricalAsOneHot(ColumnTransform):

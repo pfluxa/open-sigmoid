@@ -5,11 +5,10 @@ import torch
 from torcheval.metrics import MulticlassAccuracy
 
 from sigmoid.nn.base import Base
-from sigmoid.nn.convolutional import EfficientBackbone1D
-from sigmoid.preprocessing.local.coordinate_files import LocalLoader
+from sigmoid.preprocessing.dataloaders import torch_DataLoader
+from sigmoid.nn.fully_connected import FullyConnectedBlock
 
-
-class Convolutional1DSwitch(Base):
+class FCSwitch(Base):
     """ Implementation of a convolutional 1D switch.
 
         This switch uses an EfficientNet backbone to classify codecs
@@ -25,7 +24,7 @@ class Convolutional1DSwitch(Base):
             @param n_routes: int
                 number of routes for the switch.
         """
-        super(Convolutional1DSwitch, self).__init__(
+        super(FCSwitch, self).__init__(
             (input_dim, ), (n_routes, ),
             'convolutional_1d_switch'
         )
@@ -50,7 +49,7 @@ class Convolutional1DSwitch(Base):
                          device=self.device_id_)
         w = w / w.sum()
         self.cluster_weights_ = w
-        self.loss_fn_ = torch.nn.CrossEntropyLoss(weight=w)
+        self.loss_fn_ = torch.nn.CrossEntropyLoss() #weight=w)
         self.loss_fn_.to(self.device_id_)
 
     def build(self,
@@ -67,10 +66,7 @@ class Convolutional1DSwitch(Base):
                 parameter to control the depth of the convolutional
                 backbone.
         """
-        self.model_ = EfficientBackbone1D(self.in_[0], self.out_[0],
-                                          n_filters=n_filters,
-                                          kernel_size=kernel_size,
-                                          alpha=depth_scale)
+        self.model_ = FullyConnectedBlock(self.in_[0], self.out_[0], 3, 30)#, activation=torch.nn.LeakyReLU())
         self.model_.build()
         self.model_.to(self.device_id_)
 
@@ -93,8 +89,8 @@ class Convolutional1DSwitch(Base):
         return logits
 
     def fit(self,
-            train_loader: LocalLoader,
-            test_loader: LocalLoader,
+            train_loader: torch_DataLoader,
+            test_loader: torch_DataLoader,
             n_epochs: int):
         """ Trains switch.
 
@@ -105,6 +101,8 @@ class Convolutional1DSwitch(Base):
             @param n_epochs: int
                 number of epochs to run training for.
         """
+        criterion = torch.nn.CrossEntropyLoss(reduction='mean')
+        criterion.to(self.device_id_)
         metric = MulticlassAccuracy(num_classes=self.out_[0])
         metric.to(self.device_id_)
         optimizer = torch.optim.Adam(self.parameters(), lr=1E-4)
@@ -115,12 +113,13 @@ class Convolutional1DSwitch(Base):
                 x = x.to(self.device_id_)
                 y = y.to(self.device_id_)
                 optimizer.zero_grad()
-                y_hat = torch.nn.functional.softmax(self.model_(x), dim=-1)
-                loss = torch.nn.functional.cross_entropy(y_hat, y)
+                y_hat = self.model_(x)
+                loss = criterion(y_hat, torch.argmax(y, dim=1))
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
-
+            self.train(False)
+            
             self.eval()
             test_loss = 0.0
             metric.reset()
@@ -128,13 +127,13 @@ class Convolutional1DSwitch(Base):
                 for x, y in test_loader:
                     x = x.to(self.device_id_)
                     y = y.to(self.device_id_)
-                    y_hat = torch.nn.functional.softmax(self.model_(x), dim=-1)
-                    loss = torch.nn.functional.cross_entropy(y_hat, y)
+                    y_hat = self.model_(x)
+                    loss = criterion(y_hat, torch.argmax(y, dim=1))
                     test_loss += loss.item()
                     pred = torch.argmax(y_hat, dim=1)
                     target = torch.argmax(y, dim=1)
                     metric.update(pred, target)
 
             acc = metric.compute()
-            println = "{:+04d} {:4.4f} {:4.4f} {:4.4f}"
-            print(println.format(epoch + 1, epoch_loss, test_loss, acc))
+            println = "{:+04d} {:4.4f} {:4.4f} {:4.4f}%"
+            print(println.format(epoch + 1, epoch_loss, test_loss, acc * 100))

@@ -1,4 +1,5 @@
 # https://github.com/tuttelikz/conv_output_size
+import signal
 import unittest
 
 import numpy as np
@@ -6,6 +7,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+class GracefulExiter():
+
+    def __init__(self):
+        self.state = False
+        signal.signal(signal.SIGINT, self.change_state)
+
+    def change_state(self, signum, frame):
+        print("exit flag set to True (repeat to exit now)")
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        self.state = True
+
+    def exit(self):
+        return self.state
 
 def conv1d_output_size(input_size, out_channels, padding, kernel_size, stride, dilation=None):
     """According to https://pytorch.org/docs/stable/generated/torch.nn.Conv1d.html

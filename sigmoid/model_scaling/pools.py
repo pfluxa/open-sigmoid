@@ -1,34 +1,47 @@
 import copy
+import math
 
 import torch
 
-from sigmoid.local.preprocessing.coordinate_files import LocalLoader
+from einops import rearrange
 
+from sigmoid.preprocessing.dataloaders import torch_DataLoader
+from sigmoid.nn.utils import GracefulExiter
 
 class StochasticPool(torch.nn.Module):
     """ Implementation of a switch MoE.
     """
 
-    def __init__(self, encoder, task):
-        """ Initializes MoE.
+    @staticmethod
+    def dummy(x):
+        return x
 
-        @param encoder: torch.nn.Module
-            model used in soul-capturing step.
-        @param task: str
-            name of task: supported names are 'regression',
-            'binary_classificatio' and 'classification
+    @staticmethod
+    def as_flat_tensor(x):
+        return x.squeeze()
+
+    @staticmethod
+    def onehot_to_ordinal(x):
+        y = torch.argmax(x, dim=-1)
+        return y
+
+    @staticmethod
+    def logits_to_ordinal(x):
+        x = torch.nn.functional.softmax(x, dim=-1)
+        y = torch.argmax(x, dim=-1)
+        return y
+
+    def __init__(self, task):
+        """ Initializes MoE.
         """
         super(StochasticPool, self).__init__()
 
-        self.enc_ = encoder
-        for p in self.enc_.parameters():
-            p.requires_grad = False
+        self.autoencoder_ = torch.nn.Module
 
         self.ne_ = -1
         self.skills_ = torch.nn.ModuleList
         self.s_loss_ = None
         self.skill_metric_ = []
-        self.skill_out_n_dim_ = -1
 
         self.switch_ = torch.nn.Module
         self.routes_ = torch.Tensor
@@ -39,11 +52,39 @@ class StochasticPool(torch.nn.Module):
         self.balancing_ = torch.Tensor
         self.task_ = task
 
-        self.temp_ = 4.0
+        self.tmax_ = 3.0
+        self.tmin_ = 0.1
+        self.temp_ = self.tmax_
+        self.stop_cooling_ = False
+        self.entropy_ = -1.0
         self.curr_skill_ = 0
         self.curr_skill_val_ = 0
 
         self.device_id_ = torch.device
+
+        self.target_postproc_ = StochasticPool.as_flat_tensor
+        if self.task_ == 'classification':
+            self.target_postproc_ = StochasticPool.onehot_to_ordinal
+
+        self.prediction_postproc_ = StochasticPool.as_flat_tensor
+        if self.task_ == 'classification':
+            self.prediction_postproc_ = StochasticPool.onehot_to_ordinal
+
+        self.cooldown_scale_ = None
+
+    def cool_down(self, step):
+
+        k = -math.log(self.tmax_ / self.tmin_)
+        new_temp = self.tmax_ * math.exp(k * step / self.cooldown_scale_)
+        if new_temp < self.tmin_:
+            self.temp_ = self.tmin_
+            return False
+        else:
+            self.temp_ = new_temp
+            return True
+
+    def set_cooldown_scale(self, dt: int):
+        self.cooldown_scale_ = dt
 
     def set_device(self, device_id: torch.device):
         """ Set device to run training/inference
@@ -60,7 +101,6 @@ class StochasticPool(torch.nn.Module):
         self.s_loss_ = skill_loss
         self.s_loss_.to(self.device_id_)
 
-        self.skill_out_n_dim_ = skill_model.get_output_dims()[0]
         skill_model = skill_model.to(self.device_id_)
         self.skills_ = self._clone_module_list(skill_model, n_skills)
 
@@ -79,7 +119,27 @@ class StochasticPool(torch.nn.Module):
         """ Sets switch.
         """
         self.switch_ = switch_model
+        for p in self.switch_.parameters():
+            p.requires_grad = False
+        # unfreeze very last layer
+        for name, param in self.switch_.model_.named_parameters():
+            if 'output' in name:
+                param.requires_grad = True
+
         self.switch_.to(self.device_id_)
+
+    def freeze_switch(self):
+        for p in self.switch_.parameters():
+            p.requires_grad = False
+
+    def set_autoencoder(self, ae_model: torch.nn.Module):
+        """ Sets auto-encoder.
+        """
+        self.autoencoder_ = ae_model
+        for name, param in self.autoencoder_.named_parameters():
+            print(name)
+            param.requires_grad = False
+        self.autoencoder_.model_.to(self.device_id_)
 
     def set_switch_balancing(self, class_weights):
         """ Sets routing balancing scheme.
@@ -89,55 +149,39 @@ class StochasticPool(torch.nn.Module):
                          device=self.device_id_)
         w = w / w.sum()
         self.balancing_ = w
-        self.switch_loss_ = torch.nn.CrossEntropyLoss(weight=w)
+        self.switch_loss_ = torch.nn.CrossEntropyLoss() #weight=w)
         self.switch_loss_.to(self.device_id_)
 
-    def forward(self, x_in: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, y) -> torch.Tensor:
         """ Performs forward pass.
 
             The switching is performed on a per-batch basis, so that
             different "rows" in the batch get routed to different skills.
         """
-        # outputs = torch.zeros((x_in.shape[0], self.skill_out_n_dim_),
-        #                       dtype=torch.float32)
-        # outputs = outputs.to(self.device_id_)
+        x_num, x_cat = x
+        self.autoencoder_(x_num, x_cat)
+        codecs = self.autoencoder_.get_encodings()
+        embeddings = self.autoencoder_.get_embedded_input()
+        logits = self.switch_(codecs)
+        logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+        labels = torch.nn.functional.gumbel_softmax(logprobs, tau=self.temp_, hard=True)
 
-        _ = self.enc_(x_in)
-        c = self.enc_.get_encodings()
-        logits = self.switch_(c)
-        #print("logits:", logits[torch.isnan(logits)])
-        self.routing_ = torch.nn.functional.gumbel_softmax(logits, tau=self.temp_)
-        self.routes_ = torch.argmax(self.routing_, dim=1)
-        self.mask_ = self.routes_ == self.curr_skill_
+        y_list = []
+        y_hat_list = []
+        invalid_idx = []
+        for sidx in range(0, self.ne_):
+            bool_msk = labels[:, sidx] > 0.99
+            if bool_msk.sum() == 0:
+                invalid_idx.append(sidx)
+                continue
+            msk = torch.where(bool_msk)[0].long()
+            e_in = torch.flatten(embeddings[msk, :], start_dim=1)
+            y_hat = self.skills_[sidx](e_in)
 
-        skill_output = self.skills_[self.curr_skill_](x_in[self.mask_, :])
-        # outputs[self.mask_, :] = skill_output
+            y_list.append(y[msk, :])
+            y_hat_list.append(y_hat)
 
-        return skill_output, self.mask_
-
-    def loss_fn(self, y_hat, y,
-                alpha: float = 2.0,
-                beta: float = 1.0,
-                gamma: float = 1.0,
-                eps: float = 1e-20) -> torch.Tensor:
-        """ Computes loss of model and balancing loss of switch.
-        """
-        # balancing loss
-        m = torch.sum(self.routing_)
-        n = torch.sum(self.routing_[:, self.curr_skill_])
-        x = n / (m + eps)
-        b0 = 1.0 / self.ne_  # self.balancing_[self.curr_skill_]
-        r = torch.pow(x - b0, alpha)
-        p = torch.pow(x, beta)
-        q = torch.pow(1.0 - x, gamma)
-        b = r / (p * q + eps)
-
-        # specialist loss
-        s = 0.0
-        if torch.sum(self.mask_) > 0:
-            s = self.s_loss_(y_hat, y[self.mask_, :])
-
-        return s + b
+        return y_hat_list, y_list, invalid_idx
 
     def get_routes(self):
         """ Returns routes to experts.
@@ -145,128 +189,142 @@ class StochasticPool(torch.nn.Module):
         return self.routes_
 
     def train_single_epoch(self,
-                           data_loader: LocalLoader,
+                           epoch: int,
+                           data_loader: torch_DataLoader,
                            optimizer: torch.optim.Optimizer):
-        """ Train auto-encoder for a single epoch.
-
-            @param
-        """
         self.train()
         epoch_loss = 0.0
-        for x, y in data_loader:
-            x = x.to(self.device_id_)
+
+        for x_num, x_cat, y in data_loader:
+            # x_num = rearrange(x_num, 'r c -> c r')
+            x_cat = rearrange(x_cat, 'r c -> c r')
+            x_num = x_num.to(self.device_id_)
+            x_cat = x_cat.to(self.device_id_)
             y = y.to(self.device_id_)
+
             optimizer.zero_grad()
-            y_hat, _ = self(x)
-            loss = self.loss_fn(y_hat, y)
+
+            y_hat_list, y_list, bad_idx = self((x_num, x_cat), y)
+
+            sidx = 0
+            loss = 0.0
+            for i in range(0, self.ne_):
+                if i not in bad_idx:
+                    loss += self.s_loss_(y_hat_list[sidx], y_list[sidx])
+                    sidx += 1
             loss.backward()
             optimizer.step()
+
             epoch_loss += loss.item()
 
-            # update specialist to train
-            self.curr_skill_ = self.curr_skill_ + 1
-            self.curr_skill_ = self.curr_skill_ % int(self.ne_)
+        if not self.stop_cooling_:
+            cooldown_success = self.cool_down(epoch)
+            if not cooldown_success:
+                self.freeze_switch()
+                self.stop_cooling_ = True
 
         return epoch_loss
 
-    def eval_single_epoch(self, data_loader: LocalLoader):
+    def eval_single_epoch(self, data_loader: torch_DataLoader):
         """ Runs model in validation data.
         """
+
         for metric in self.skill_metric_:
             metric.reset()
 
         self.eval()
         eval_loss = 0.0
         with torch.no_grad():
-            updated = []
-            for x, y in data_loader:
+            for x_num, x_cat, y in data_loader:
+                # x_num = rearrange(x_num, 'r c -> c r')
+                x_cat = rearrange(x_cat, 'r c -> c r')
+                x_num = x_num.to(self.device_id_)
+                x_cat = x_cat.to(self.device_id_)
 
-                self.curr_skill_ = self.curr_skill_val_
-
-                x = x.to(self.device_id_)
                 y = y.to(self.device_id_)
-                y_hat, mask = self(x)
-                loss = self.loss_fn(y_hat, y)
+
+                y_hat_list, y_list, bad_idx = self((x_num, x_cat), y)
+
+                sidx = 0
+                loss = 0.0
+                for i in range(0, self.ne_):
+                    if i not in bad_idx:
+                        loss += self.s_loss_(y_hat_list[sidx], y_list[sidx])
+                        sidx += 1
                 eval_loss += loss.item()
 
-                y_s = y[mask, :]
-                e = self.curr_skill_val_
-                if torch.sum(mask) > 0:
-                    if self.task_ == 'classification':
-                        pred = torch.argmax(y_hat, dim=1)
-                        target = torch.argmax(y_s, dim=1)
-                        self.skill_metric_[e].update(pred, target)
-                    elif self.task_ == 'binary_classification':
-                        pred = torch.zeros_like(y_hat,
-                                                dtype=torch.int64,
-                                                device=self.device_id_)
-                        target = torch.zeros_like(y_s,
-                                                dtype=torch.int64,
-                                                device=self.device_id_)
-                        target[y_s > 0.5] = 1
-                        pred[y_hat > 0.5] = 1
-                        self.skill_metric_[e].update(pred, target)
-                    else:
-                        self.skill_metric_[e].update(y_hat, y_s)
-                    updated.append(e)
-
-                # update specialist to train
-                self.curr_skill_val_ = self.curr_skill_val_ + 1
-                self.curr_skill_val_ = self.curr_skill_val_ % int(self.ne_)
+                sidx = 0
+                for i in range(0, self.ne_):
+                    if i not in bad_idx:
+                        target = self.target_postproc_(y_list[sidx])
+                        pred = self.prediction_postproc_(y_hat_list[sidx])
+                        self.skill_metric_[sidx].update(
+                            pred, target
+                        )
+                        sidx += 1
 
             metric_vals = []
-            for i, metric in enumerate(self.skill_metric_):
-                if i not in updated:
-                    metric_vals.append(-1.0)
-                else:
-                    metric_vals.append(metric.compute())
+            for metric in self.skill_metric_:
+                metric_vals.append(metric.compute())
 
         return eval_loss, metric_vals
 
     def fit(self, train_loader, val_loader, n_epochs: int):
         """ Trains model on dataset.
         """
+        stop_flag = GracefulExiter()
         optimizer = torch.optim.Adam(self.parameters(), lr=1E-4)
+        # optimizer = torch.optim.SGD(self.parameters(), lr=1E-5)
 
         self.curr_skill_ = 0
         self.curr_skill_val_ = 0
         for epoch in range(n_epochs):
-            epoch_loss = self.train_single_epoch(train_loader, optimizer)
+            epoch_loss = self.train_single_epoch(epoch, train_loader, optimizer)
             eval_loss, m_values = self.eval_single_epoch(val_loader)
-            println = "{:+04d} {:4.4f} {:4.4f} {:4.4f}"
-            for _ in range(len(self.skill_metric_)):
-                println += " |{:+4.4f}| "
-            print(println.format(epoch + 1, epoch_loss, eval_loss, self.temp_,
-                                    *m_values))
+            println = "{:+04d} {:4.5e} {:4.5e} {:4.5e}\n"
+            print(println.format(epoch + 1, epoch_loss, eval_loss, self.temp_))
+            println = ""
+            for sidx in range(len(self.skill_metric_)):
+                println += f"  skill_{sidx}: "
+                println += f"{m_values[sidx]} \n"
+            print(println)
 
-            self.temp_ = self.temp_ * 0.99
-            if self.temp_ < 0.1:
-                self.temp_ = 0.1
+            if stop_flag.exit():
+                print('-' * 89)
+                print('Exiting from training early')
+                print('-' * 89)
+                break
 
-    def evaluate(self, eval_loader) -> list:
+    def evaluate(self, data_loader) -> list:
         """ Runs model on evaluation dataset.
         """
+        self.eval()
         gt = []
         preds = []
-        routes = []
         with torch.no_grad():
-            for e in range(self.ne_):
-                self.curr_skill_ = e
-                for x, y in eval_loader:
-                    x = x.to(self.device_id_)
-                    y = y.to(self.device_id_)
-                    y_hat, mask = self(x)
-                    if torch.sum(mask) > 0:
-                        r = self.get_routes()
-                        preds.append(y_hat)
-                        gt.append(y[mask, :])
-                        routes.append(r[mask])
+            for x_num, x_cat, y in data_loader:
+                # x_num = rearrange(x_num, 'r c -> c r')
+                x_cat = rearrange(x_cat, 'r c -> c r')
+                x_num = x_num.to(self.device_id_)
+                x_cat = x_cat.to(self.device_id_)
+                y = y.to(self.device_id_)
+                y_hat_list, y_list, bad_idx = self((x_num, x_cat), y)
+                sidx = 0
+                for i in range(0, self.ne_):
+                    if i not in bad_idx:
+                        target = self.target_postproc_(y_list[sidx])
+                        pred = self.prediction_postproc_(y_hat_list[sidx])
+                        preds.append(pred)
+                        gt.append(target)
+                        print(len(preds), len(gt))
+                        sidx += 1
+                # routes.append(labels)
 
         predictions = torch.cat(preds).cpu().numpy()
         ground_truth = torch.cat(gt).cpu().numpy()
-        skill_route = torch.cat(routes).cpu().numpy()
+        # skill_route = torch.cat(routes).cpu().numpy()
 
-        return [ground_truth, predictions, skill_route, ]
+        return [ground_truth, predictions] #, skill_route, ]
 
     @staticmethod
     def _clone_module_list(module, n_clones: int):
