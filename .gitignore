@@ -1,6 +1,6 @@
 # Data folder
 data/
-
+*.h5
 # Poetry
 poetry.lock
 
