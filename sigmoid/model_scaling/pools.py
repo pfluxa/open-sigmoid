@@ -313,13 +313,12 @@ class StochasticPool(torch.nn.Module):
                 for i in range(0, self.ne_):
                     if i not in bad_idx:
                         target = self.target_postproc_(y_list[sidx])
-                        pred = self.prediction_postproc_(y_hat_list[sidx])
-                        preds.append(pred)
+                        predct = self.prediction_postproc_(y_hat_list[sidx])
+                        preds.append(predct)
                         gt.append(target)
-                        print(len(preds), len(gt))
+                        print(predct.shape, target.shape)
                         sidx += 1
                 # routes.append(labels)
-
         predictions = torch.cat(preds).cpu().numpy()
         ground_truth = torch.cat(gt).cpu().numpy()
         # skill_route = torch.cat(routes).cpu().numpy()

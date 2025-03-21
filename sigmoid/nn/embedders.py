@@ -1,5 +1,6 @@
 
 from os import read
+from types import CodeType
 import numpy as np
 import torch
 from einops import rearrange
@@ -36,20 +37,26 @@ class Autoembedder(nn.Module):
         encoder = torch.nn.Sequential(
             torch.nn.Linear(n_features, 100),
             torch.nn.LeakyReLU(),
-            torch.nn.Linear(100, 1000),
+            torch.nn.Linear(100, 2000),
             torch.nn.LeakyReLU(),
-            torch.nn.Dropout(0.5),
-            torch.nn.Linear(1000, 100),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(2000, 2000),
+            torch.nn.LeakyReLU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(2000, 100),
             torch.nn.LeakyReLU(),
             torch.nn.Linear(100, codec_dim),
         )
         decoder = torch.nn.Sequential(
             torch.nn.Linear(codec_dim, 100),
             torch.nn.LeakyReLU(),
-            torch.nn.Linear(100, 1000),
+            torch.nn.Linear(100, 2000),
             torch.nn.LeakyReLU(),
-            torch.nn.Dropout(0.5),
-            torch.nn.Linear(1000, 100),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(2000, 2000),
+            torch.nn.LeakyReLU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(2000, 100),
             torch.nn.LeakyReLU(),
             torch.nn.Linear(100, n_features),
         )
@@ -77,12 +84,12 @@ class Autoembedder(nn.Module):
 
         self.embedding_sizes_ = embedding_sizes
         self.config = config
+        self.codec_dim_ = config['codec_dim']
         self.last_target: Optional[torch.Tensor] = None
         self.code_value: Optional[torch.Tensor] = None
         self.embeddings = nn.ModuleList([
                 nn.Sequential(
                     nn.Embedding(t[0], t[1]),
-                    nn.Dropout(p=0.1),
                     nn.BatchNorm1d(t[1]),
                 )
                 for t in embedding_sizes[1:]
@@ -92,35 +99,18 @@ class Autoembedder(nn.Module):
         self.n_features_ = n_features
         self.num_embeddings_ = torch.nn.ModuleList([
             nn.Sequential(
-                nn.Linear(embedding_sizes[0][0], embedding_sizes[0][1], bias=False),
-                nn.BatchNorm1d(embedding_sizes[0][1]),
+                nn.Linear(embedding_sizes[0][0], embedding_sizes[0][1], bias=True),
             )
         ])
-        self.logvar_ = torch.nn.Linear(
-            config['codec_dim'], config['codec_dim']
+        self.logvar_ = nn.Sequential(
+            torch.nn.Linear(config['codec_dim'], config['codec_dim'] * config['codec_dim']),
         )
-        self.mu_ = torch.nn.Linear(
-            config['codec_dim'], config['codec_dim']
+        self.mu_ = nn.Sequential(
+            torch.nn.Linear(config['codec_dim'], config['codec_dim'] * config['codec_dim']),
         )
-        self.sigmoid1_ = nn.Sigmoid()
-        self.sigmoid2_ = nn.Sigmoid()
-        self.temperature_ = nn.Parameter(torch.tensor(1.0))
-
-    def _activation(self, x: torch.Tensor) -> torch.Tensor:
-        if self.config.get("activation", "tanh") == "tanh":
-            return nn.Tanh()(x)
-        if self.config.get("activation", "tanh") == "relu":
-            return nn.ReLU()(x)
-        if self.config.get("activation", "tanh") == "leaky_relu":
-            return nn.LeakyReLU()(x)
-        if self.config.get("activation", "tanh") == "elu":
-            return nn.ELU()(x)
-        raise ValueError(
-            f"""
-            Unsupported activation: `{self.config['activation']}`!.
-            Please pick one of the following: `tanh`, `relu`, `leaky_relu`, `elu`.
-            """
-        )
+        self.leaky_relu_ = nn.LeakyReLU()
+        self.softmax_ = nn.Softmax(dim=2)
+        self.temperature_ = torch.tensor(1.0)
 
     def forward(self, x_cat: torch.Tensor, x_cont: torch.Tensor) -> torch.Tensor:
         """
@@ -146,21 +136,17 @@ class Autoembedder(nn.Module):
             x.clone().detach()
         )  # Concatenated x values - used with the custom loss function: `AutoEmbLoss`.
         x = self.encoder(x)
-        l = self.logvar_(x)
-        u = self.mu_(x)
-        s = self.sigmoid1_(x)
+        l = self.logvar_(x).view((-1, self.codec_dim_, self.codec_dim_))
+        u = self.mu_(x).view((-1, self.codec_dim_, self.codec_dim_))
 
         z1 = self.reparameterize(u, l)
-
-        eps = torch.rand_like(s)
-        z2 = self.sigmoid2_(torch.log(s + 1e-7) - torch.log(-torch.log(eps + 1e-7) + 1e-7))
-
-        x = z2 * x + z1
+        z2 = self.softmax_(z1)
+        x = self.leaky_relu_(torch.einsum('ijk,ij->ij', z2, x))
         code_value = x.clone().detach()  # Stores the values of the code layer.
 
         x = self.decoder(x)
 
-        return x, last_target, code_value , u, l, z2
+        return x, last_target, code_value , u, l
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """

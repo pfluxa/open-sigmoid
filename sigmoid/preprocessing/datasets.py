@@ -172,14 +172,20 @@ class StandardDataset(torch_Dataset):
 
         return weights
 
+    def get_split(self, split_type: str, split_id: int, read: bool = True):
+        
+        split_idx = None
+        if read:
+            split_idx = self.h5file_[f"{split_type}_split_{split_id}"][:]
+        else:
+            split_idx = self.h5file_[f"{split_type}_split_{split_id}"]
+
+        return split_idx
+
+
     def get_train_split(self, split_id: int = 0, read: bool = True) -> numpy.ndarray:
         """ Returns training split
         """
-        split = self.h5file_[f'train_split_{split_id}']
-        if read:
-            split = self.h5file_[f'train_split_{split_id}'][:]
-
-        return split
 
     def get_test_split(self, split_id: int = 0, read: bool = True) -> numpy.ndarray:
         """ Returns training split
@@ -734,6 +740,16 @@ class MixedTypesAutoencoderDataset(torch_Dataset):
 
         self.return_y_ = False
 
+    def get_split(self, split_type: str, split_id: int, read: bool = True):
+        
+        split_idx = None
+        if read:
+            split_idx = self.h5file_[f"{split_type}_split_{split_id}"][:]
+        else:
+            split_idx = self.h5file_[f"{split_type}_split_{split_id}"]
+
+        return split_idx
+    
     def get_input_dim(self) -> int:
         """ Returns number of features in X data.
         """

@@ -17,14 +17,11 @@ import os
 import copy
 import json
 from collections import OrderedDict
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import h5py
 import numpy
 import pandas
-
-import torch
-
-from torch.masked import masked_tensor, as_masked_tensor
 
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import StratifiedShuffleSplit
@@ -277,7 +274,22 @@ class Cache:
     """
     Cache object for non-distributed environments.
     """
-
+    __clustering_fraction__: float = 0.1
+    __train_fraction__: float = 0.6
+    __test_fraction__: float = 0.15
+    __val_fraction__: float = 0.15
+    __ignore_fraction__: float = 1e-10
+    
+    __default_splits__: List[Dict] = [
+        {
+            'training': __train_fraction__,
+            'testing': __test_fraction__,
+            'validation': __val_fraction__,
+            'clustering': __clustering_fraction__,
+            'ignore': __ignore_fraction__
+        },
+    ]
+        
     def __init__(self, dataframe: pandas.DataFrame,
                  target: str = None,
                  ignore: list = []) -> None:
@@ -304,8 +316,13 @@ class Cache:
         self.col_trafos_ = {}
         # self.cleaners_ = {}
         self.col_types_ = {}
-        self.train_splits_ = []
-        self.test_splits_ = []
+        self.splits_ = {
+            'training': [],
+            'testing': [],
+            'validation': [],
+            'clustering': []
+        }
+        self.rng_ = numpy.random.default_rng(42)
 
     def load_column_types(self, path: str) -> None:
         """ Reads column types from JSON.
@@ -447,66 +464,107 @@ class Cache:
             self.y_meta_data_.add_column(self.target_, 0, coltype, coltrafo)
 
     def build_splits(self,
-                     splits: list = [{'global_fraction': 1.0,
-                                      'val_fraction': 0.2}],
-                     random_state: int = 42,
-                     stratified: bool = False) -> None:
+                     splits: Optional[List[Dict]] = None,
+                     stratified_split: bool = False) -> None:
         """ Performs stratified splitting of the data.
 
-            @param splits: list of dictionaries
-                must have at least one entry with keywords
+            @param splits (optional): list of dictionaries
+                
+                Splits must contain at least one entry (a dict)
+                with these keywords.
 
-                'val_fraction':
+                'training':
                     floating point number between 0.0 and 1.0
                     to specify the fraction of the dataset used
-                    for validation. Defaults to 0.2
+                    for training. Defaults to 0.6
 
-                'global_fraction':
-                    as 'val_fraction', but specifying the fraction
-                    of the dataset used in global terms (for training
-                    and validation) Defaults to 1.0
+                'testing':
+                    similar to 'training', but specifying the fraction
+                    of the dataset used for testing. Data corresponding
+                    to this split is not used to adjusted model parameters
+                    but to monitor the model's ability to generalize to
+                    unseen data points. Defaults to 0.15
 
-            This routine takes into account different class weights when
-            performing the split by applying a stratified sampling scheme
-            that preserves the probability distribution of the data for
-            categorical and binary targets. For numerical targets, uniform
-            sampling is used.
+                'validation':
+                    similar to 'testing'; data within this split is not
+                    used during model training and it is only used when
+                    evaluating the model agaisnt unseen data. Defaults
+                    to 0.15.
+                    
+                'clustering':
+                    fraction of the dataset used evaluate the model's
+                    ability to deliver meaningful clusters. Data within
+                    this split is not used during training. Defaults
+                    to 0.1.
+                    
+                In addition, the dictionary may contain an 'ignore' 
+                keyword specifying the fraction of the data that shall
+                not be used at all. 
+
+            @param stratified_splitting (optional, boolean)
+            
+                Toggles the usage of a stratified sampling scheme so as to
+                approximately preserve the probability distribution of a
+                categorical target. Has no effect is target is continuous.
+                Defaults to False.
+                
+            @param random_state (optional, int)
+            
+                Seed used for pseudo-random generation. 
+                Defaults to the answer of the meaning of life, the Universe
+                and everything (42)
+                
+            @note
+                - If 'ignore' is provided in the splits, the corresponding
+                  data will *not* be sampled in a stratified manner.
+                - If 'ignore' keyword is provided on split N, all subsequent
+                  splits will be built using the data ignored in closest,
+                  previous split that had an 'ignore' keyword.
         """
-        if self.target_ is None or (not stratified):
-            X = self.x_data_
+        if splits is None:
+            splits = self.__default_splits__
+        nx = len(self.x_data_)
+        idx = numpy.arange(0, nx, dtype='int64')
+        keep_mask = numpy.ones(nx, dtype=bool)
+        if self.target_ is None or (not stratified_split):
             for split_info in splits:
-                val_fraction = split_info.get('val_fraction', 0.2)
-                global_fraction = split_info.get('global_fraction', 1.0)
-                idx_cutoff = int(len(X) * global_fraction)
-                idx = numpy.arange(0, idx_cutoff)
-                train_index, test_index = train_test_split(
-                                            idx,
-                                            test_size=val_fraction,
-                                            shuffle=True,
-                                            random_state=random_state)
-                self.train_splits_.append(train_index)
-                self.test_splits_.append(test_index)
+               
+                f_i = 0.0 
+                if 'ignore' in split_info:
+                    f_i = split_info['ignore']
+                    del split_info['ignore']
+                    msk = self.rng_.choice([True, False], p=[1.0 - f_i, f_i],
+                                size=nx, replace=True)
+                    keep_mask = numpy.logical_and(keep_mask, msk)
+                    
+                s_p = list(split_info.keys())
+                s_f = list(split_info.values())
+                # check splits add up to 1.0 
+                if abs(sum(s_f) - 1.0) > 1e-4:
+                    raise ValueError("[ERROR] split fractions must add up to 1")
+                
+                # build Purpose of Index (poidx)
+                pidx = self.rng_.choice(s_p, p=s_f,
+                    size=nx, replace=True,
+                )
+                train_index = idx[
+                    numpy.logical_and(pidx == 'training', keep_mask)
+                ]
+                test_index = idx[
+                    numpy.logical_and(pidx == 'testing', keep_mask)
+                ]
+                cltr_index = idx[
+                    numpy.logical_and(pidx == 'clustering', keep_mask)
+                ]
+                val_index = idx[
+                    numpy.logical_and(pidx == 'validation', keep_mask)
+                ]
+                self.splits_['training'].append(train_index)
+                self.splits_['testing'].append(test_index)
+                self.splits_['validation'].append(val_index)
+                self.splits_['clustering'].append(cltr_index)
         else: 
-            X = self.x_data_
-            Y = self.y_data_
-            target = self.y_meta_data_.get_columns()[0]
-            target_type = self.y_meta_data_.get_column_type(target)
-            if target_type == 'categorical' and stratified:
-                for split_info in splits:
-                    val_fraction = split_info.get('val_fraction', 0.2)
-                    global_fraction = split_info.get('global_fraction', 1.0)
-
-                    idx_cutoff = int(len(X) * global_fraction)
-                    Xs = X[:idx_cutoff]
-                    Ys = Y[:idx_cutoff]
-
-                    msss = \
-                        MultilabelStratifiedShuffleSplit(n_splits=1,
-                                                        test_size=val_fraction,
-                                                        random_state=random_state)
-                    for train_index, test_index in msss.split(Xs, Ys):
-                        self.train_splits_.append(train_index)
-                        self.test_splits_.append(test_index)
+            raise NotImplementedError("Work in progress!")
 
     def to_hdf5(self, path: str) -> None:
         """ Writes data to HDF5 file.
@@ -535,14 +593,15 @@ class Cache:
         # write meta-data
         h5file['x'].attrs.update(self.x_meta_data_)
         # write splits
-        i = 0
-        for train_idx, test_idx in zip(self.train_splits_, self.test_splits_):
-            h5file.create_dataset(f'train_split_{i}', train_idx.shape,
-                                  data=train_idx)
-            h5file.create_dataset(f'test_split_{i}', test_idx.shape,
-                                  data=test_idx)
-            i = i + 1
-        h5file.attrs['n_splits'] = numpy.asarray([i, ])
+        for split_type in self.splits_.keys():
+            for i, split_idx in enumerate(self.splits_[split_type]):
+                s_name = str(f"{split_type:s}_split_{i:d}")
+                h5file.create_dataset(s_name,
+                    split_idx.shape,
+                    data=split_idx,
+                    track_order=True
+                )
+        h5file.attrs['n_splits'] = numpy.asarray([len(self.splits_["training"]), ])
         # close file
         h5file.close()
 
@@ -568,9 +627,11 @@ class Cache:
             self.target_ = next(iter(self.y_meta_data_))
         # read splits
         n_splits = int(h5file.attrs['n_splits'][0])
-        for i in range(n_splits):
-            self.train_splits_.append(h5file[f'train_split_{i}'])
-            self.test_splits_.append(h5file[f'test_split_{i}'])
+        for split_type in self.splits_:
+            for i in range(n_splits):
+                self.splits_[split_type].append(
+                    h5file[f"{split_type}_split_{i}"]
+                )
         # read data
         self.data_ = None
         x_data = h5file['x']

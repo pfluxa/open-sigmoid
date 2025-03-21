@@ -26,10 +26,8 @@ class AutoEmbedderWrapper(torch.nn.Module):
         self.n_numeric_ = n_numerical
         self.n_catg_ = len(embedding_sizes)
         self.embsz_ = embedding_sizes
-        self.in_features_ = n_numerical + sum(
-            emb_info[1] for emb_info in embedding_sizes
-        )
         model = Autoembedder(self.config_, self.n_numeric_, self.embsz_)
+        self.in_features_ = model.n_features_
         self.model_ = model # torch.nn.DataParallel(model)
         self.reconstruction_loss_ = torch.nn.MSELoss(reduction='mean')
         self.prior = torch.tensor(0.5)
@@ -66,7 +64,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
 
     def get_n_input(self):
 
-        return (self.n_catg_ + 1) * self.embsz_[0][1]
+        return self.in_features_
 
     def get_encodings(self) -> torch.Tensor:
         """ Returns encodings of last mini-batch pass.
@@ -84,14 +82,17 @@ class AutoEmbedderWrapper(torch.nn.Module):
     def forward(self, x_cont: torch.Tensor, x_cat: torch.Tensor) -> torch.Tensor:
         """ Overloads forward method.
         """
-        x, lt, ct, u, l, b = self.model_(x_cat, x_cont)
-        h_loss = torch.mul(b, torch.log(b + 1e-20) - torch.log(self.prior)) \
-               + torch.mul(1 - b, torch.log(1 - b + 1e-20) - torch.log(1 - self.prior))
-        kld_loss = torch.mean(-0.5 * torch.sum(1 + l - u ** 2 - l.exp(), dim = 1), dim = 0)
+        x, lt, ct, u, l = self.model_(x_cat, x_cont)
+        # h_loss = torch.mul(b, torch.log(b + 1e-20) - torch.log(self.prior)) \
+        #        + torch.mul(1 - b, torch.log(1 - b + 1e-20) - torch.log(1 - self.prior))
+        kld_loss = torch.mean(
+            (-0.5 * torch.sum(1 + l - u ** 2 - l.exp(), dim = 2)).sum(dim = 1), dim=0
+        )
         self.last_target_ = lt
         self.code_value_ = ct
 
-        return x, kld_loss, torch.mean(h_loss.sum(dim=1), dim=0)
+        # return x, kld_loss, torch.mean(h_loss.sum(dim=1), dim=0)
+        return x, kld_loss
 
     def train_single_epoch(self,
                            dataloader: DataLoader,
@@ -113,11 +114,12 @@ class AutoEmbedderWrapper(torch.nn.Module):
             optimizer.zero_grad()
             # run autoencoder on batch
             with torch.autocast(device_type="cuda"):
-                x_emb_hat, kld_loss, h_loss = self(x_num, x_cat)
+                # x_emb_hat, kld_loss, h_loss = self(x_num, x_cat)
+                x_emb_hat, kld_loss = self(x_num, x_cat)
                 x_emb = self.get_embedded_input()
                 reconstruction_loss = self.reconstruction_loss_(x_emb_hat, x_emb)
-                regularization_loss = sum(p.abs().sum() for p in self.parameters())
-                loss = reconstruction_loss + 1e-7*regularization_loss + (h_loss + kld_loss) * self.kld_weight_
+                regularization_loss = sum(p.abs().sum() for p in self.parameters()) / n_params
+                loss = reconstruction_loss + (kld_loss + 0.0001 * regularization_loss) * self.kld_weight_
             # print(regularization_loss.item())
             # adjust learning weights
             loss.backward()
@@ -129,7 +131,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
 
         return epoch_loss
 
-    def eval_single_epoch(self, dataloader: DataLoader):
+    def eval_single_epoch(self, dataloader: DataLoader, n_params: int):
         """ Runs model in validation data.
         """
         self.eval()
@@ -143,11 +145,13 @@ class AutoEmbedderWrapper(torch.nn.Module):
                 x_num = x_num.to(self.compute_device_)
                 x_cat = x_cat.to(self.compute_device_)
                 # run autoencoder on batch
-                x_emb_hat, kld_loss, h_loss = self(x_num, x_cat)
+                # x_emb_hat, kld_loss, h_loss = self(x_num, x_cat)
+                x_emb_hat, kld_loss = self(x_num, x_cat)
                 x_emb = self.get_embedded_input()
                 reconstruction_loss = self.reconstruction_loss_(x_emb_hat, x_emb)
-                regularization_loss = sum(p.abs().sum() for p in self.parameters())
-                loss = reconstruction_loss + 1e-7*regularization_loss + (kld_loss + h_loss) * self.kld_weight_
+                regularization_loss = sum(p.abs().sum() for p in self.parameters()) / n_params
+                # loss = reconstruction_loss + (h_loss + kld_loss + 0.0001 *regularization_loss) * self.kld_weight_
+                loss = reconstruction_loss + (kld_loss + 0.0001 *regularization_loss) * self.kld_weight_
                 # update running (training) loss
                 testing_loss += loss.item()
                 # compute metrics
@@ -209,13 +213,13 @@ class AutoEmbedderWrapper(torch.nn.Module):
         logline += "{test_loss:+04.4e},"
         logline += "{mse:+04.4e},"
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=1E-3, weight_decay=1E-5)
+        optimizer = torch.optim.Adam(self.parameters(), lr=1E-3)
         for epoch in range(0, n_epochs):
             # train/evaluate
             tic = time.time()
 
             train_loss = self.train_single_epoch(train_loader, optimizer, n_params)
-            test_loss = self.eval_single_epoch(test_loader)
+            test_loss = self.eval_single_epoch(test_loader, n_params)
             toc = time.time()
 
             # create logging message
@@ -246,3 +250,12 @@ class AutoEmbedderWrapper(torch.nn.Module):
                 # training_log['reconstruction_error'].append(self.get_test_mse(epoch))
 
         return training_log
+
+    def evaluate(self, val_loader: DataLoader):
+        """ Fit auto-encoder to data coming from `train_loader`, evaluating
+            using data from `test_loader`.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        _ = self.eval_single_epoch(val_loader, n_params)
+
+        return self.metric_['mse'][0]

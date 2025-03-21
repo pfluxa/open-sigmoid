@@ -134,31 +134,25 @@ class StandardLoader(torch_DataLoader):
                 An instance of LocalDataset.
         """
         super(StandardLoader, self).__init__(dataset)
-
         self.dataset_ = dataset
 
-    def get_dataset_loader(self, batch_size, num_workers: int = 0):
-        """ Returns DataLoader that iterates over Dataset
-            in order, that is, following the original index.
-        """
-        if num_workers > 0 and num_workers is not None:
-            loader = torch_DataLoader(
-                self.dataset_,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                drop_last=False)
-        else:
-            loader = torch_DataLoader(
-                self.dataset_,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                drop_last=False)
+    def get_loader(self, split_type, split_id, batch_size,
+                   num_workers: int = 0,
+                   shuffle: bool = True):
+        split_dataset = self.dataset_
+        if split_type != "all":
+            split_idx = self.dataset_.get_split(split_type, split_id, read=True)
+            split_dataset = Subset(self.dataset_, split_idx.tolist())
+        
+        loader = torch_DataLoader(
+            split_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            drop_last=False)
 
         return loader
         
-
     def get_train_loader(self,
                          split_id: int,
                          batch_size: int, 
