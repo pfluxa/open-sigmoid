@@ -36,7 +36,7 @@ from sigmoid.analysis.clustering import ClusterFinder
 def read_data(path, nrows: int):
     """ Returns dataframe with a random sample of original data.
     """
-    raw_dataframe = pandas.read_csv(path, low_memory=False, nrows=10000000)
+    raw_dataframe = pandas.read_csv(path, low_memory=False, nrows=100000)
     dataframe = raw_dataframe.sample(n=nrows, replace=False)
     dataframe = dataframe.reset_index(drop=True)
 
@@ -130,9 +130,9 @@ class Skill(torch.nn.Module):
 
 if __name__ == '__main__':
 
-    B = 8192
-    N = 2000000
-    codec_dim = 7
+    B = 128
+    N = 120000
+    codec_dim = 10
     compute_device = torch.device('cuda')
     #torch.autograd.set_detect_anomaly(True)
     tic = time.time()
@@ -143,13 +143,28 @@ if __name__ == '__main__':
     data_frame = cleanse(data_frame)
 
     # create local cache
+    splits = [
+        {
+            'training': 0.6,
+            'testing': 0.2,
+            'validation': 0.1,
+            'clustering': 0.1,
+            'ignore': 0.5,
+        },
+        {
+            'training': 0.6,
+            'testing': 0.2,
+            'validation': 0.1,
+            'clustering': 0.1,
+        }
+    ]
     cache = Cache(data_frame, 'ARR_DELAY', ignore=['FL_DATE', 'CANCELLATION_CODE'])
     cache.load_column_types('/home/pedro/projects/open-sigmoid/data/airline_delays/data_types.json')
     cache.attach_type_transformation('numerical', MinMaxTransform)
     cache.attach_type_transformation('categorical', CategoricalAsOrdinal)
     cache.transform()
     cache.populate_metadata()
-    cache.build_splits()
+    cache.build_splits(splits)
     cache.to_hdf5('./temp.h5')
 
     # create dataset and data loaders
@@ -158,18 +173,20 @@ if __name__ == '__main__':
 
     print("setting up dataloaders...")
     dataloader = StandardLoader(dataset)
-    train_loader = dataloader.get_train_loader(split_id=0, num_workers=8, batch_size=B)
-    test_loader = dataloader.get_test_loader(split_id=0, num_workers=8, batch_size=B)
-
+    train_loader = dataloader.get_loader("training", 0, batch_size=B)
+    test_loader = dataloader.get_loader("testing", 0, batch_size=B, shuffle=False)
+    val_loader = dataloader.get_loader("validation", 0, batch_size=B, shuffle=False)
+    clus_loader = dataloader.get_loader("clustering", 0, batch_size=B)
+    
     # create model
     print("setting up autoencoder... ")
     n_x_num = len(dataset.get_input_numerical_columns())
     c_x_cat = dataset.get_cardinalities()
     max_emb_size = max(c_x_cat)
     print("max cardinality:", max_emb_size)
-    emb_sizes = [(n_x_num, n_x_num // 2)]
+    emb_sizes = [(n_x_num, int(math.sqrt(n_x_num) + 1))]
     for c in c_x_cat:
-        emb_sizes.append((c, c // 2))
+        emb_sizes.append((c, int(math.sqrt(c) + 1)))
     parameters = {
         "hidden_layers": [[100, 1000], [1000, 100], [100, codec_dim]],
         "activation": "leaky_relu",
@@ -184,22 +201,23 @@ if __name__ == '__main__':
     ae.to(compute_device)
 
     print("training autoencoder...")
-    ae.fit(train_loader, test_loader, n_epochs=100)
-
-    # encode testing set
-    test_encoded = ae.encode_data(test_loader)
-    train_encoded = ae.encode_data(train_loader)
-    test_encoded = test_encoded.cpu().numpy().reshape((-1, codec_dim))
-    train_encoded = train_encoded.cpu().numpy().reshape((-1, codec_dim))
+    ae.fit(train_loader, test_loader, n_epochs=200)
+    val_score = ae.evaluate(val_loader)
+    print(f"MSE on validation set: {val_score:4.4e}")
+    
+    # encode clustering set
+    test_encoded = ae.encode_data(clus_loader)
+    # maximum number of points is 40000 because my computer is too crappy
+    test_encoded = test_encoded.cpu().numpy().reshape((-1, codec_dim))[0:40000]
 
     # find clusters
     clusterer = ClusterFinder(
         min_samples=5,
-        min_cluster_size=20,
-        cluster_selection_method='eom',
-        cluster_selection_epsilon=0.01,
+        min_cluster_size=5,
+        cluster_selection_method='leaf',
+        cluster_selection_epsilon=0.0,
         # n_jobs=12,
-        metric='euclidean'
+        metric='precomputed'
     )
     test_labels = clusterer.find_clusters(test_encoded)
     # clusterer.elbow_kmeans(test_encoded)
@@ -261,8 +279,8 @@ if __name__ == '__main__':
     # setup dataset and data loaders to train switch
     switch_dataset = StandardDataset('./temp_switch_cache.h5', cache_all=True)
     switch_loader = StandardLoader(switch_dataset)
-    switch_train_loader = switch_loader.get_train_loader(split_id=0, batch_size=64)
-    switch_test_loader = switch_loader.get_test_loader(split_id=0, batch_size=64)
+    switch_train_loader = switch_loader.get_loader("training", split_id=0, batch_size=B, shuffle=True)
+    switch_test_loader = switch_loader.get_loader("testing", split_id=0, batch_size=B)
 
     # build and train switch
     switch = FCSwitch(codec_dim, n_clusters)
@@ -274,8 +292,9 @@ if __name__ == '__main__':
     scaler_dataset = MixedTypesAutoencoderDataset('./temp.h5', cache_all=True)
     scaler_dataset.toggle_return_y()
     scaler_loader = StandardLoader(scaler_dataset)
-    scaler_train_loader = scaler_loader.get_train_loader(split_id=0, shuffle=True, batch_size=256, num_workers=4)
-    scaler_test_loader = scaler_loader.get_test_loader(split_id=0, shuffle=False, batch_size=256, num_workers=4)
+    scaler_train_loader = scaler_loader.get_loader("training", split_id=1, shuffle=True, batch_size=B, num_workers=4)
+    scaler_test_loader = scaler_loader.get_loader("testing", split_id=1, shuffle=False, batch_size=B, num_workers=4)
+    scaler_val_loader = scaler_loader.get_loader("validation", split_id=1, shuffle=False, batch_size=1, num_workers=4)
 
     # build skill
     skill = Skill(ae.get_n_input(), 1)
@@ -295,7 +314,7 @@ if __name__ == '__main__':
     specialist.fit(scaler_train_loader, scaler_test_loader, n_epochs=100)
 
     # report output on test data
-    gt, pr = specialist.evaluate(scaler_test_loader)
+    gt, pr = specialist.evaluate(scaler_val_loader)
 
     pred_df = pandas.DataFrame()
     pred_df['ground_truth'] = gt.ravel()
