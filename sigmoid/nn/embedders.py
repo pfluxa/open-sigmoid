@@ -1,6 +1,8 @@
 
-from os import read
+from os import read, system
 from types import CodeType
+
+from networkx.algorithms.hybrid import kl_connected_subgraph
 import numpy as np
 import torch
 from einops import rearrange
@@ -9,149 +11,262 @@ from torch import nn
 from typing import Dict, List, NamedTuple, Optional, Tuple
 from typing import Callable, Union, Any, TypeVar
 
-from sigmoid.nn.efficient_net import EfficientNet1D, InverseEfficientNet1D
+from sigmoid.nn.embeddings import NumericalEmbeddingPLE
+from sigmoid.nn.embeddings import CategoricalEmbedding
 
 
 class Autoembedder(nn.Module):
 
-    def get_autoencoder(self) -> Tuple[nn.Sequential, nn.Sequential, int]:
+    def __init__(self, architecture: Dict[str, Any]) -> None:
         """
         Args:
-            num_cont_features (int): Number of continues features.
-        Returns:
-            Tuple[torch.nn.Sequential, torch.nn.Sequential]: Tuple containing the encoder and decoder.
-        """
-
-        n_features = 0
-        for t in self.embedding_sizes_:
-            n_features += t[1]
-        print(f"n features: {n_features}")
-        codec_dim = self.config["codec_dim"]
-        # width_mult = self.config.get('width_multiplier', 1.0)
-        # encoder = EfficientNet1D(n_channels=n_features, output_dim=codec_dim, width_mult=width_mult)
-        # decoder = InverseEfficientNet1D(
-        #     in_features=codec_dim, out_channels=n_features,
-        #     input_dim=codec_dim, output_dim=self.embsz_,
-        #     width_mult=width_mult
-        # )
-        encoder = torch.nn.Sequential(
-            torch.nn.Linear(n_features, 100),
-            torch.nn.LeakyReLU(),
-            torch.nn.Linear(100, 2000),
-            torch.nn.LeakyReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(2000, 2000),
-            torch.nn.LeakyReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(2000, 100),
-            torch.nn.LeakyReLU(),
-            torch.nn.Linear(100, codec_dim),
-        )
-        decoder = torch.nn.Sequential(
-            torch.nn.Linear(codec_dim, 100),
-            torch.nn.LeakyReLU(),
-            torch.nn.Linear(100, 2000),
-            torch.nn.LeakyReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(2000, 2000),
-            torch.nn.LeakyReLU(),
-            torch.nn.Dropout(0.1),
-            torch.nn.Linear(2000, 100),
-            torch.nn.LeakyReLU(),
-            torch.nn.Linear(100, n_features),
-        )
-        return encoder, decoder, n_features
-
-    def __init__(
-        self,
-        config: Dict,
-        num_cont_features: int,
-        embedding_sizes: List[Tuple[int, int]],
-    ) -> None:
-        """
-        Args:
-            config (Dict[str, Any]): Configuration for the model.
+            architecture (Dict[str, Any]): Configuration for the model.
                 In the [documentation](https://chrislemke.github.io/autoembedder/#parameters) all possible parameters are listed.
-            num_cont_features (int): Number of continues features.
-            embedding_sizes (Optional[List[Tuple[int, int]]]): List of tuples.
+            embedding_sizes (List[Tuple[int, int]]): List of tuples.
                 Each tuple contains the size of the dictionary (unique values) of embeddings and the size of each embedding vector.
                 Only needs to be provided if categorical columns are used.
 
         Returns:
             None
         """
-        super().__init__()
+        super(Autoembedder, self).__init__()
 
-        self.embedding_sizes_ = embedding_sizes
-        self.config = config
-        self.codec_dim_ = config['codec_dim']
-        self.last_target: Optional[torch.Tensor] = None
-        self.code_value: Optional[torch.Tensor] = None
-        self.embeddings = nn.ModuleList([
-                nn.Sequential(
-                    nn.Embedding(t[0], t[1]),
-                    nn.BatchNorm1d(t[1]),
-                )
-                for t in embedding_sizes[1:]
-            ]
+        self.config = {}
+        for k, v in architecture.items():
+            self.config[k] = v
+
+        self.hidden_dim_ = -1
+        self.codec_dim_ = architecture['codec_dim']
+        self.n_features_ = -1
+        self.num_last_target_: Optional[torch.Tensor] = None
+        self.cat_last_target_: Optional[torch.Tensor] = None
+        self.code_value_: Optional[torch.Tensor] = None
+
+        self.num_emb_ = nn.Module
+        self.enc_num_ = nn.Module
+
+        self.cat_emb_ = nn.Module
+        self.enc_cat_ = nn.Module
+
+        self.decoder_ = nn.Module
+
+        self.d_num_ = -1
+        self.c_num_ = -1
+
+    def build_embedding_layers(
+        self,
+        n_numerical_features: int,
+        mkbin_out: Dict[str, Any],
+        cardinalities: List[int],
+    ):
+        """ Build the embedding layers.
+        """
+        self.n_num_ = n_numerical_features
+        self.n_cat_ = len(cardinalities)
+        # numerical embedding
+        num_embeddings = NumericalEmbeddingPLE(n_numerical_features, **mkbin_out)
+        # categorical embeddings
+        cat_embeddings = CategoricalEmbedding(cardinalities)
+
+        self.num_emb_ = num_embeddings
+        self.d_num_ = num_embeddings.max_emb_dim_
+        src_mask = torch.zeros((self.n_num_, self.n_num_), dtype=torch.bool)
+        self.register_buffer('num_src_mask_', src_mask)
+
+        self.cat_emb_ = cat_embeddings
+        self.d_cat_ = cat_embeddings.max_emb_dim_
+        src_mask = torch.zeros((self.n_cat_, self.n_cat_), dtype=torch.bool)
+        self.register_buffer('cat_src_mask_', src_mask)
+
+        self.num_pooling_ = nn.Sequential(
+            nn.Flatten(start_dim=1),
+            nn.Linear(
+                self.d_num_ * self.n_num_,
+                self.codec_dim_
+            ),
         )
-        self.encoder, self.decoder, n_features = self.get_autoencoder()
-        self.n_features_ = n_features
-        self.num_embeddings_ = torch.nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(embedding_sizes[0][0], embedding_sizes[0][1], bias=True),
+        self.cat_pooling_ = nn.Sequential(
+            nn.Flatten(start_dim=1),
+            nn.Linear(
+                self.d_cat_ * self.n_cat_,
+                self.codec_dim_
+            ),
+        )
+
+    def build_decoder(self):
+        """
+        Build the decoder model.
+        """
+        decoder_block = nn.ModuleList()
+        # create decoder
+        hidden_dims = self.config['decoder_dims']
+        for i in range(0, len(hidden_dims)):
+            layer = nn.Linear(
+                hidden_dims[i]['in_dim'],
+                hidden_dims[i]['out_dim'],
             )
-        ])
-        self.logvar_ = nn.Sequential(
-            torch.nn.Linear(config['codec_dim'], config['codec_dim'] * config['codec_dim']),
-        )
-        self.mu_ = nn.Sequential(
-            torch.nn.Linear(config['codec_dim'], config['codec_dim'] * config['codec_dim']),
-        )
-        self.leaky_relu_ = nn.LeakyReLU()
-        self.softmax_ = nn.Softmax(dim=2)
-        self.temperature_ = torch.tensor(1.0)
+            decoder_block.append(layer)
+        decoder = nn.Sequential(*decoder_block)
 
-    def forward(self, x_cat: torch.Tensor, x_cont: torch.Tensor) -> torch.Tensor:
+        self.num_unpooling_ = nn.Linear(hidden_dims[-1]['out_dim'], self.d_num_)
+        self.cat_unpooling_ = nn.Linear(hidden_dims[-1]['out_dim'], self.d_cat_)
+        self.decoder_ = decoder
+
+    def build_cat_encoder(self) -> None:
+        """ Build the categorical encoder model.
+        """
+        print(f"building encoder layer with d_model = {self.d_cat_}")
+        encoder_block = nn.TransformerEncoderLayer(
+            d_model=self.d_cat_,
+            nhead=1,
+            dim_feedforward=128,
+        )
+        encoder = nn.TransformerEncoder(
+            encoder_block, num_layers=1,
+            enable_nested_tensor=False
+        )
+
+        self.cat_encoder_ = encoder
+
+    def build_num_encoder(self) -> None:
+        """ Build the numerical encoder model.
+        """
+        print(f"building encoder layer with d_model = {self.d_num_}")
+        encoder_block = nn.TransformerEncoderLayer(
+            d_model=self.d_num_,
+            nhead=1,
+            dim_feedforward=128,
+        )
+        encoder = nn.TransformerEncoder(
+            encoder_block, num_layers=1,
+            enable_nested_tensor=False
+        )
+
+        self.num_encoder_ = encoder
+
+    def forward(self,
+            x_cat: torch.Tensor,
+            x_cont: torch.Tensor,
+            mask_idx_num: Optional[int] = None,
+            mask_idx_cat: Optional[int] = None
+        ) -> Tuple[torch.Tensor,
+                   torch.Tensor,
+                   torch.Tensor,
+                   torch.Tensor,
+                   torch.Tensor,
+                   torch.Tensor]:
         """
         Args:
             x_cat (torch.Tensor): Tensor including the categorical values. Shape: [columns count, batch size]
             x_cont (torch.Tensor): Tensor including the continues values. Shape: [columns count, batch size]
         Returns:
-            torch.Tensor :Output of the 'Autoembedder'. It contains the concatenated and processed continues and categorical data.
+           torch.Tensor :Output of the 'Autoembedder'. It contains the concatenated and processed continues and categorical data.
         """
-        # x_cont = rearrange(x_cont, 'c b -> b c')
-        x_emb = []
-        for i, layer in enumerate(self.num_embeddings_):
-            y = layer(x_cont)
-            x_emb.append(y)
+        num_emb, num_key_msk = self.num_emb_(x_cont)
+        num_msk = self.num_src_mask_.clone().detach()
+        num_msk[:, mask_idx_num] = True
+        num_last_target = (num_emb.clone().detach())[mask_idx_num]
 
-        for i, layer in enumerate(self.embeddings):
-            value = x_cat[i].int()
-            y = layer(value)
-            x_emb.append(y)
+        cat_emb, cat_key_msk = self.cat_emb_(x_cat)
+        cat_msk = self.cat_src_mask_.clone().detach()
+        cat_msk[:, mask_idx_cat] = True
+        cat_last_target = (cat_emb.clone().detach())[mask_idx_cat]
 
-        x = torch.cat(x_emb, 1)
-        last_target = (
-            x.clone().detach()
-        )  # Concatenated x values - used with the custom loss function: `AutoEmbLoss`.
-        x = self.encoder(x)
-        l = self.logvar_(x).view((-1, self.codec_dim_, self.codec_dim_))
-        u = self.mu_(x).view((-1, self.codec_dim_, self.codec_dim_))
+        # emb shape: B x n_features x embedding_dim
+        # we can take n_features = seq_length and
+        # create a mask that prevents tokens from
+        # attending to a particular one.
+        #
+        # according to docs
+        # [src/tgt/memory]_mask ensures that position i is allowed to
+        # attend the unmasked positions. If a BoolTensor is provided,
+        # positions with True are not allowed to attend while False
+        # values will be unchanged.
+        # column-wise masking
+        # m = rearrange(m, 'r c->c r')
+        # m[midx, :] = True
+        # m = rearrange(m, 'c r->r c')
+        # print("num emb shape:", num_emb.shape)
+        # print("num msk shape:", num_msk.shape)
+        # print("num msk key shape:", num_key_msk.shape)
+        num_h = self.num_encoder_(num_emb, mask=num_msk, src_key_padding_mask=num_key_msk)
+        num_h = rearrange(num_h, 's b n -> b s n')
+        num_z = self.num_pooling_(num_h)
 
-        z1 = self.reparameterize(u, l)
-        z2 = self.softmax_(z1)
-        x = self.leaky_relu_(torch.einsum('ijk,ij->ij', z2, x))
-        code_value = x.clone().detach()  # Stores the values of the code layer.
+        # print("cat emb shape:", cat_emb.shape)
+        # print("cat msk shape:", cat_msk.shape)
+        # print("cat msk key shape:", cat_key_msk.shape)
+        cat_h = self.cat_encoder_(cat_emb, mask=cat_msk, src_key_padding_mask=cat_key_msk)
+        cat_h = rearrange(cat_h, 's b n -> b s n')
+        cat_z = self.cat_pooling_(cat_h)
 
-        x = self.decoder(x)
+        z = num_z + cat_z
 
-        return x, last_target, code_value , u, l
+        sec_loss = self.spherical_embedding_loss(z)
+        code_value = z.clone().detach()
 
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        w = self.decoder_(z)
+        num_x = self.num_unpooling_(w)
+        cat_x = self.cat_unpooling_(w)
+
+        return (
+            num_x, cat_x,
+            num_last_target, cat_last_target,
+            code_value,
+            sec_loss)
+
+    def spherical_embedding_loss(self, x):
+
+        xn = x.norm(p=2, dim=1)
+        xn_mean = xn.mean().detach()
+        l_sec = xn - xn_mean
+        l_sec = (l_sec * l_sec).sum() / x.shape[0]
+
+        return l_sec
+
+    def kld_bernoulli(self, p):
+
+        kld_loss = torch.mul(p,
+            torch.log(p + 1e-10) - torch.log(self.prior_)
+        ) + torch.mul(1 - p, torch.log(1 - p + 1e-10) - torch.log(1 - self.prior_))
+        kld_loss = kld_loss.sum() / p.shape[0]
+
+        return kld_loss
+
+    def kld_normal(self, mu, logvar):
+
+        kld_loss = 1 + logvar - torch.pow(mu, 2) - torch.exp(logvar)
+        kld_loss = kld_loss.sum() / mu.shape[0]
+        kld_loss *= -0.5
+
+        return kld_loss
+
+    def reparam_bernoulli(self, p: torch.Tensor, temperature: Optional[torch.Tensor] = torch.tensor(0.1)) -> torch.Tensor:
         """
-        Reparameterization trick to sample from N(mu, var) from
-        N(0,1).
+        Reparameterization trick to sample from Bernoulli(logits).
+
+        :param p: (Tensor)
+            Strictly positive output from previous layer
+        :param temperature: (Optional, Tensor)
+            Set to ~5 to obtain random outputs. Defaults to 0.1.
+        :return: (Tensor) [B x D]
+
+        :note
+            Reparameterization:
+            -- Let u be a uniform random variale in [0,1], p be the predicted probability (i.e. input),
+            -- let l be the temperature.
+            -- y = sigmoid((log(p) + log(u) - log(1 - u))/l)
+
+        :note
+            The reparameterization trick assumes that the next layer is a Sigmoid layer
+        """
+        u = torch.rand_like(p)
+        y = (torch.log(p) + torch.log(u) - torch.log(1 - u)) / temperature
+        return y
+
+    def reparam_normal(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """
+        Reparameterization trick to sample from N(mu, var) from N(0,1).
         :param mu: (Tensor) Mean of the latent Gaussian [B x D]
         :param logvar: (Tensor) Standard deviation of the latent Gaussian [B x D]
         :return: (Tensor) [B x D]

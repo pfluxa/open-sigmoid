@@ -13,9 +13,9 @@ from sigmoid.preprocessing.transformations import CategoricalAsOneHot
 class StandardDataset(torch_Dataset):
 
     def __init__(self, path: str, cache_all: bool = False, sort_by: str = None, as_tensor: bool = True):
-        
+
         super(StandardDataset, self).__init__()
-        
+
         self.numerical_ = []
         self.categorical_ = []
         self.h5file_ = h5py.File(path, 'r', driver='core') #swmr=True)
@@ -24,13 +24,13 @@ class StandardDataset(torch_Dataset):
         self.transform_before_sort_ = False
         self.sort_by_target_ = False
         self.return_tensor_ = as_tensor
-        
+
         self.x_meta_data_ = MetaData()
         self.y_meta_data_ = MetaData()
-        
+
         self.x_meta_data_.from_hdf5_attributes(self.h5file_['x'].attrs)
         self.y_meta_data_.from_hdf5_attributes(self.h5file_['y'].attrs)
-       
+
         for col_name in self.x_meta_data_.get_columns():
             col_type = self.x_meta_data_.get_column_type(col_name)
             idx = self.x_meta_data_.get_column_index(col_name)
@@ -46,7 +46,7 @@ class StandardDataset(torch_Dataset):
                     self.sort_col_ = col_name
                 if self.x_meta_data_.get_transformed_column_length(col_name) > 1:
                     self.transform_before_sort_ = True
-                    
+
         for col_name in self.y_meta_data_.get_columns():
             col_type = self.y_meta_data_.get_column_type(col_name)
             idx = self.y_meta_data_.get_column_index(col_name)
@@ -70,7 +70,7 @@ class StandardDataset(torch_Dataset):
 
         self.n_rows_ = self.h5file_['x'].shape[0]
         self.n_input_ = self.h5file_['x'].shape[1]
-        
+
         self.all_cached_ = cache_all
         if self.all_cached_:
             self.x_data_ = numpy.array(self.h5file_['x'][()])
@@ -94,7 +94,7 @@ class StandardDataset(torch_Dataset):
                 y = trafo(df).to_numpy().reshape((-1, 1))
             self.x_data_ = self.x_data_[y[:, self.sort_idx_].argsort()]
             self.y_data_ = self.y_data_[y[:, self.sort_idx_].argsort()]
-   
+
     def get_input_dim(self) -> int:
         """ Returns number of features in X data.
         """
@@ -119,7 +119,8 @@ class StandardDataset(torch_Dataset):
     def get_input_numerical_columns(self) -> list:
         """ Returns list of column ranges with numerical data.
         """
-        return self.numerical_
+        c = [idx for idx in self.numerical_]
+        return c
 
     def get_input_class_weights(self) -> list:
         """ Returns list of numpy.ndarray with relative class weights.
@@ -173,7 +174,7 @@ class StandardDataset(torch_Dataset):
         return weights
 
     def get_split(self, split_type: str, split_id: int, read: bool = True):
-        
+
         split_idx = None
         if read:
             split_idx = self.h5file_[f"{split_type}_split_{split_id}"][:]
@@ -207,9 +208,9 @@ class StandardDataset(torch_Dataset):
             if col_type == 'categorical':
                 params = self.x_meta_data_.get_parameter_data(col_name)
                 n_classes.append(len(params['class_names']))
-        
+
         return n_classes
-    
+
     def __len__(self):
         """ Returns number of rows in dataset.
         """
@@ -226,29 +227,29 @@ class StandardDataset(torch_Dataset):
         else:
             x_data = self.h5file_['x'][index, :]
             y_data = self.h5file_['y'][index, :]
-       
-        if self.return_tensor_: 
-            X = torch.tensor(x_data, dtype=torch.float32)        
+
+        if self.return_tensor_:
+            X = torch.tensor(x_data, dtype=torch.float32)
             y = torch.tensor(y_data, dtype=torch.float32)
         else:
             X = numpy.atleast_1d(x_data)
             y = numpy.atleast_1d(y_data)
-             
+
         return X, y
 
 
 class GroupedDataset(torch_Dataset):
 
     def __init__(self, path: str, column_groups: list, cache_all: bool = False):
-        
+
         super(GroupedDataset, self).__init__()
-        
+
         self.numerical_ = []
         self.categorical_ = []
         self.grouped_input_idx_ = []
         for _ in range(len(column_groups)):
             self.grouped_input_idx_.append([])
-        self.grouped_target_idx_ = [] 
+        self.grouped_target_idx_ = []
         for _ in range(len(column_groups)):
             self.grouped_target_idx_.append([])
         self.h5file_ = h5py.File(path, 'r', driver='core') #swmr=True)
@@ -256,12 +257,12 @@ class GroupedDataset(torch_Dataset):
         self.sort_col_ = None
         self.transform_before_sort_ = False
         self.sort_by_target_ = False
-        
+
         self.x_meta_data_ = MetaData()
-        
+
         self.x_meta_data_.from_hdf5_attributes(self.h5file_['x'].attrs)
-        
-        offset = 0 
+
+        offset = 0
         for col_name in self.x_meta_data_.get_columns():
             col_type = self.x_meta_data_.get_column_type(col_name)
             idx = self.x_meta_data_.get_column_index(col_name)
@@ -281,15 +282,15 @@ class GroupedDataset(torch_Dataset):
                         for j in range(0, col_length):
                             self.grouped_target_idx_[i].append(idx + j + offset)
                         offset += col_length - 1
-                    
+
         self.n_rows_ = self.h5file_['x'].shape[0]
         self.n_input_ = self.h5file_['x'].shape[1]
-        
+
         self.all_cached_ = cache_all
         if self.all_cached_:
             self.x_data_ = numpy.array(self.h5file_['x'][()])
-            
-   
+
+
     def get_input_dim(self) -> int:
         """ Returns number of features in X data.
         """
@@ -396,9 +397,9 @@ class GroupedDataset(torch_Dataset):
             if col_type == 'categorical':
                 params = self.x_meta_data_.get_parameter_data(col_name)
                 n_classes.append(len(params['class_names']))
-        
+
         return n_classes
-    
+
     def __len__(self):
         """ Returns number of rows in dataset.
         """
@@ -416,10 +417,10 @@ class GroupedDataset(torch_Dataset):
             else:
                 x_data = self.h5file_['x'][index, grp_idx_input]
                 y_data = self.h5file_['x'][index, grp_idx_target]
-            X = torch.tensor(x_data, dtype=torch.float32)        
+            X = torch.tensor(x_data, dtype=torch.float32)
             y = torch.tensor(y_data, dtype=torch.float32)
             grouped.append((X, y))
-        
+
         return grouped
 
 
@@ -462,14 +463,14 @@ class BatchMixedTypesAutoencoderDataset(torch_IterableDataset):
 
         self.n_rows_ = self.h5file_['x'].shape[0]
         self.n_input_ = self.h5file_['x'].shape[1]
-        
+
         # self.all_cached_ = True
         # self.x_data = self.h5file_['x'][()]
         # self.y_data = self.h5file_['y'][()]
         self.shuffle_ = False
         self.idx_ = None
         self.return_y_ = False
-        
+
         self.start = 0
         self.end = self.n_rows_
         self.rng_ = numpy.random.default_rng(seed=42)
@@ -527,12 +528,12 @@ class BatchMixedTypesAutoencoderDataset(torch_IterableDataset):
         return weights
 
     def get_y_data_types(self):
-        
+
         col_types = []
         for col_name in self.y_meta_data_.get_columns():
             col_type = self.y_meta_data_.get_column_type(col_name)
             col_types.append(col_type)
-            
+
         return col_types
 
     def get_output_class_weights(self) -> list:
@@ -562,12 +563,12 @@ class BatchMixedTypesAutoencoderDataset(torch_IterableDataset):
         return weights
 
     def set_as_dataset(self):
-        
+
         self.x_data = self.h5file_['x'][()]
         self.y_data = self.h5file_['y'][()]
 
     def set_as_training(self, split: int):
-        
+
         idx = self.get_train_split(split_id=split, read=True)
         idx = numpy.sort(idx)
         self.x_data = self.h5file_['x'][idx, :]
@@ -575,17 +576,17 @@ class BatchMixedTypesAutoencoderDataset(torch_IterableDataset):
 
         self.start = 0
         self.end = len(idx)
-        
+
     def set_as_testing(self, split: int):
 
         idx = self.get_test_split(split_id=split, read=True)
         idx = numpy.sort(idx)
         self.x_data = self.h5file_['x'][idx, :]
         self.y_data = self.h5file_['y'][idx, :]
-        
+
         self.start = 0
         self.end = len(idx)
-    
+
     def get_train_split(self, split_id: int = 0, read: bool = True) -> numpy.ndarray:
         """ Returns training split
         """
@@ -593,7 +594,7 @@ class BatchMixedTypesAutoencoderDataset(torch_IterableDataset):
         if read:
             split_data = self.h5file_[f'train_split_{split_id}'][()]
             return split_data
-        
+
         return split
 
     def get_test_split(self, split_id: int = 0, read: bool = True) -> numpy.ndarray:
@@ -615,21 +616,21 @@ class BatchMixedTypesAutoencoderDataset(torch_IterableDataset):
             if col_type == 'categorical':
                 params = self.x_meta_data_.get_parameter_data(col_name)
                 n_classes.append(len(params['class_names']))
-        
+
         return n_classes
 
     def toggle_return_y(self):
-        
+
         self.return_y_ = not self.return_y_
 
     def shuffle(self, idx = None):
-        
+
         if idx is None:
             idx = numpy.arange(self.start, self.end, 1)
             self.rng_.shuffle(idx)
         self.x_data = self.x_data[idx]
         self.y_data = self.y_data[idx]
-        
+
         return idx
 
     def __len__(self):
@@ -649,13 +650,13 @@ class BatchMixedTypesAutoencoderDataset(torch_IterableDataset):
         if worker_info is None:  # single-process data loading, return the full iterator
             pass
         # in a worker process
-        else:  
+        else:
             # split workload
             per_worker = int(math.ceil((self.end - self.start) / float(worker_info.num_workers)))
             worker_id = worker_info.id
             iter_start = self.start + worker_id * per_worker
             iter_end = min(iter_start + per_worker, self.end)
-        
+
         idx = numpy.arange(iter_start, iter_end, 1)
         # self.rng_.shuffle(idx)
         x_data = self.x_data[idx]
@@ -663,7 +664,7 @@ class BatchMixedTypesAutoencoderDataset(torch_IterableDataset):
         x_num = x_data[:, self.numerical_].astype(numpy.float32)
         if self.return_y_:
             y_data = self.y_data[idx]
-        
+
         bs = 256
         for offset in range(0, iter_end - iter_start, bs):
             x_num_t = torch.from_numpy(x_num[offset:offset + bs, :])
@@ -679,8 +680,8 @@ class BatchMixedTypesAutoencoderDataset(torch_IterableDataset):
                 yield (x_num_t, x_cat_t, y_t)
             else:
                 yield (x_num_t, x_cat_t)
-           
-     
+
+
 class MixedTypesAutoencoderDataset(torch_Dataset):
     """ Wrapper around torch.utils.data.Dataset to read Cache files.
 
@@ -732,7 +733,7 @@ class MixedTypesAutoencoderDataset(torch_Dataset):
 
         self.n_rows_ = self.h5file_['x'].shape[0]
         self.n_input_ = self.h5file_['x'].shape[1]
-        
+
         self.all_cached_ = cache_all
         if self.all_cached_:
             self.x_data = numpy.array(self.h5file_['x'][:])
@@ -741,7 +742,7 @@ class MixedTypesAutoencoderDataset(torch_Dataset):
         self.return_y_ = False
 
     def get_split(self, split_type: str, split_id: int, read: bool = True):
-        
+
         split_idx = None
         if read:
             split_idx = self.h5file_[f"{split_type}_split_{split_id}"][:]
@@ -749,7 +750,7 @@ class MixedTypesAutoencoderDataset(torch_Dataset):
             split_idx = self.h5file_[f"{split_type}_split_{split_id}"]
 
         return split_idx
-    
+
     def get_input_dim(self) -> int:
         """ Returns number of features in X data.
         """
@@ -774,7 +775,8 @@ class MixedTypesAutoencoderDataset(torch_Dataset):
     def get_input_numerical_columns(self) -> list:
         """ Returns list of column ranges with numerical data.
         """
-        return self.numerical_
+        c = [idx for idx in self.numerical_]
+        return c
 
     def get_input_class_weights(self) -> list:
         """ Returns list of numpy.ndarray with relative class weights.
@@ -856,12 +858,31 @@ class MixedTypesAutoencoderDataset(torch_Dataset):
             if col_type == 'categorical':
                 params = self.x_meta_data_.get_parameter_data(col_name)
                 n_classes.append(len(params['class_names']))
-        
+
         return n_classes
 
     def toggle_return_y(self):
-        
+
         self.return_y_ = not self.return_y_
+
+    def get_type_features(self, column_type: str):
+
+        data = []
+        col_names = []
+        x_data = None
+        if self.all_cached_:
+            x_data = self.x_data[:, :]
+        else:
+            x_data = self.h5file_['x'][:, :]
+
+        for col_name in self.x_meta_data_.get_columns():
+            col_type = self.x_meta_data_.get_column_type(col_name)
+            idx = self.x_meta_data_.get_column_index(col_name)
+            if col_type == column_type:
+                col_names.append(col_name)
+                data.append(x_data[:, None, idx])
+
+        return col_names, numpy.concatenate(data, axis=1)
 
     def __len__(self):
         """ Returns number of rows in dataset.
@@ -876,21 +897,21 @@ class MixedTypesAutoencoderDataset(torch_Dataset):
             x_data = self.x_data[index, :]
         else:
             x_data = self.h5file_['x'][index, :]
-        
+
         y_data = None
         if self.return_y_:
             if self.all_cached_:
                 y_data = self.y_data[index, :]
             else:
-                y_data = self.h5file_['y'][index, :]    
-            
+                y_data = self.h5file_['y'][index, :]
+
         x_cat = torch.tensor(x_data[self.categorical_]).long()
         x_num = torch.tensor(x_data[self.numerical_]).float()
-        
+
         if self.return_y_:
             y_data = torch.tensor(y_data).float()
             return (x_num, x_cat, y_data)
-            
+
         return (x_num, x_cat)
 
 

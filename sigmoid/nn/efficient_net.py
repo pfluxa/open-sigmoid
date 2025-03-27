@@ -65,9 +65,9 @@ class MBConvBlock1D(nn.Module):
         if expand_ratio != 1:
             self.expand = nn.Sequential(
                 nn.Conv1d(in_channels, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
-                CBAM1D(hidden_dim, expand_ratio, kernel_size=1),
-                # Swish()
+                # nn.BatchNorm1d(hidden_dim),
+                # CBAM1D(hidden_dim, expand_ratio, kernel_size=1),
+                Swish()
             )
         else:
             self.expand = nn.Identity()
@@ -76,7 +76,7 @@ class MBConvBlock1D(nn.Module):
         self.depthwise = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride,
                       padding=kernel_size // 2, groups=hidden_dim, bias=False),
-            nn.BatchNorm1d(hidden_dim),
+            # nn.BatchNorm1d(hidden_dim),
             CBAM1D(hidden_dim, expand_ratio, kernel_size=kernel_size),
             # Swish()
         )
@@ -87,8 +87,8 @@ class MBConvBlock1D(nn.Module):
             self.se = nn.Sequential(
                 nn.AdaptiveAvgPool1d(1),
                 nn.Conv1d(hidden_dim, squeezed_channels, kernel_size=1),
-                # Swish(),
-                CBAM1D(squeezed_channels, int(1./se_ratio), kernel_size=kernel_size),
+                Swish(),
+                # CBAM1D(squeezed_channels, int(1./se_ratio), kernel_size=kernel_size),
                 nn.Conv1d(squeezed_channels, hidden_dim, kernel_size=1),
                 nn.Sigmoid()
             )
@@ -98,7 +98,8 @@ class MBConvBlock1D(nn.Module):
         # Pointwise convolution
         self.pointwise = nn.Sequential(
             nn.Conv1d(hidden_dim, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(out_channels)
+            CBAM1D(hidden_dim, out_channels, 1)
+            # nn.BatchNorm1d(out_channels)
         )
 
     def forward(self, x):
@@ -114,12 +115,12 @@ class MBConvBlock1D(nn.Module):
 
 class EfficientNet1D(nn.Module):
     """EfficientNet Model for 1D inputs"""
-    def __init__(self, n_channels: int = 3, width_mult=1.0, depth_mult=1.0, dropout_rate=0.2, output_dim=10):
+    def __init__(self, input_channels: int, output_channels: int, width_mult=1.0, depth_mult=1.0, dropout_rate=0.2):
 
         super(EfficientNet1D, self).__init__()
 
         self.stem = nn.Sequential(
-            nn.Conv1d(n_channels, int(32 * width_mult), kernel_size=3, stride=2, padding=1, bias=False),
+            nn.Conv1d(input_channels, int(32 * width_mult), kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm1d(int(32 * width_mult)),
             CBAM1D(int(32 * width_mult), 1, kernel_size=3),
             # Swish()
@@ -140,22 +141,23 @@ class EfficientNet1D(nn.Module):
             MBConvBlock(int(80 * width_mult), int(80 * width_mult), kernel_size=3, stride=1, expand_ratio=6),
             MBConvBlock(int(80 * width_mult), int(80 * width_mult), kernel_size=3, stride=1, expand_ratio=6),
             # block 4
-            MBConvBlock( int(80 * width_mult), int(112 * width_mult), kernel_size=5, stride=1, expand_ratio=6),
-            MBConvBlock(int(112 * width_mult), int(112 * width_mult), kernel_size=5, stride=1, expand_ratio=6),
-            MBConvBlock(int(112 * width_mult), int(112 * width_mult), kernel_size=5, stride=1, expand_ratio=6),
-            # block 5
-            MBConvBlock(int(112 * width_mult), int(192 * width_mult), kernel_size=5, stride=2, expand_ratio=6),
-            MBConvBlock(int(192 * width_mult), int(192 * width_mult), kernel_size=5, stride=1, expand_ratio=6),
-            # block 6
-            MBConvBlock(int(192 * width_mult), int(320 * width_mult), kernel_size=3, stride=1, expand_ratio=6)
+            # MBConvBlock( int(80 * width_mult), int(112 * width_mult), kernel_size=5, stride=1, expand_ratio=6),
+            # MBConvBlock(int(112 * width_mult), int(112 * width_mult), kernel_size=5, stride=1, expand_ratio=6),
+            # MBConvBlock(int(112 * width_mult), int(112 * width_mult), kernel_size=5, stride=1, expand_ratio=6),
+            # # block 5
+            # MBConvBlock(int(112 * width_mult), int(192 * width_mult), kernel_size=5, stride=2, expand_ratio=6),
+            # MBConvBlock(int(192 * width_mult), int(192 * width_mult), kernel_size=5, stride=1, expand_ratio=6),
+            # # block 6
+            # MBConvBlock(int(192 * width_mult), int(320 * width_mult), kernel_size=3, stride=1, expand_ratio=6)
         )
 
         self.head = nn.Sequential(
-            nn.Conv1d(int(320 * width_mult), output_dim, kernel_size=1, bias=False),
+            nn.Conv1d(int(80 * width_mult), output_channels, kernel_size=1, bias=False),
+            # nn.Conv1d(int(320 * width_mult), output_channels, kernel_size=1, bias=False),
             #nn.Conv1d(int(320 * width_mult), int(1280 * width_mult), kernel_size=1, bias=False),
-            nn.BatchNorm1d(output_dim),
+            # nn.BatchNorm1d(output_channels),
             # Swish(),
-            nn.AdaptiveMaxPool1d(2)
+            nn.AdaptiveAvgPool1d(1)
         )
         #     nn.AdaptiveAvgPool1d(2),
         #     nn.Dropout(dropout_rate),
@@ -167,6 +169,7 @@ class EfficientNet1D(nn.Module):
         x = self.stem(x)
         x = self.blocks(x)
         x = self.head(x)
+        
         return x
 
 
@@ -231,12 +234,12 @@ class InverseMBConvBlock1D(nn.Module):
 
 class InverseEfficientNet1D(nn.Module):
     """Inverse of EfficientNet for 1D inputs."""
-    def __init__(self, in_features: int, out_channels: int, input_dim: int, output_dim: int, width_mult=1.0, depth_mult=1.0):
+    def __init__(self, input_channels: int, output_features: int, width_mult=1.0, depth_mult=1.0):
         super(InverseEfficientNet1D, self).__init__()
         self.inv_head = nn.Sequential(
-            nn.Linear(in_features, int(1280 * width_mult) * in_features),
-            nn.Unflatten(1, (int(1280 * width_mult), in_features)),
-            nn.ConvTranspose1d(int(1280 * width_mult), int(320 * width_mult), kernel_size=1, bias=False),
+            # nn.Linear(input_features, int(1280 * width_mult) * input_features),
+            # nn.Unflatten(1, (int(1280 * width_mult), input_features)),
+            nn.ConvTranspose1d(input_channels, int(320 * width_mult), kernel_size=1, bias=False),
             nn.BatchNorm1d(int(320 * width_mult)),
             # InverseSwish()
         )
@@ -266,19 +269,20 @@ class InverseEfficientNet1D(nn.Module):
             TransposedMBConvBlock(int(16 * width_mult), int(32 * width_mult), kernel_size=3, stride=1, expand_ratio=1)
         )
 
-        skp = find_valid_parameters(input_dim, output_dim)
-        k, s, p = skp
+        # skp = find_valid_parameters(input_features, output_features)
+        k, s, p = 1, 1, 0
         self.inv_stem = nn.Sequential(
-            nn.ConvTranspose1d(int(32 * width_mult), out_channels, kernel_size=k, stride=s, padding=p, bias=False),
-            nn.BatchNorm1d(out_channels),
+            nn.ConvTranspose1d(int(32 * width_mult), 1, kernel_size=k, stride=s, padding=p, bias=False),
+            nn.BatchNorm1d(1),
             # CBAM1D(out_channels, 1, kernel_size=k)
         )
 
     def forward(self, x):
+        print("x:", x.shape)
         x = self.inv_head(x)
-        # print("inv head:", x.shape)
+        print("inv head:", x.shape)
         x = self.inv_blocks(x)
-        # print("inv blocks:", x.shape)
+        print("inv blocks:", x.shape)
         x = self.inv_stem(x)
-        # print("inv stem:", x.shape)
+        print("inv stem:", x.shape)
         return x

@@ -1,5 +1,6 @@
 import numpy
 import numpy as np
+from typing import Optional, AnyStr
 
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
@@ -7,12 +8,12 @@ from sklearn.model_selection import train_test_split
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 
-from hdbscan import HDBSCAN
-# from sklearn.cluster import HDBSCAN
+# from hdbscan import HDBSCAN
+from sklearn.cluster import HDBSCAN
 from sklearn.cluster import AffinityPropagation
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics.pairwise import cosine_similarity, rbf_kernel
 from scipy.spatial import ConvexHull
 from scipy.sparse import csr_matrix
 
@@ -52,30 +53,30 @@ class ClusterFinder:
         print("variances")
         for c in range(0, self.n_comp_):
             print(f"[INFO][clustering::PCA] component {c} explains: {self.pca_.explained_variance_ratio_[c]:1.4f} of variance.")
-        X = cosine_similarity(data)
-        print("[INFO] distances done.")
-        # apply cut-ff
-        print("[INFO] building sparse matrix.")
-        X[X < 0.9] = 0
-        X = csr_matrix(X)
-        print("[INFO] sparse matrix done.")
-        # labels = self.aff_prop_.fit_predict(data)
-        print("[INFO] greating graph...")
-        # G = nx.from_numpy_array(X)
-        G = nx.from_scipy_sparse_array(X)
-        G.edges(data=True)
-        print("[INFO] Done greating graph.")
-        
-        print("[INFO] Detecting communities...")
-        comu = nx.community.louvain_communities(G, seed=55, backend='cugraph')
-        print(f"[INFO] Louvain community detection yielded {len(comu)} communities.")
-        
-        labels = numpy.zeros(data.shape[0], dtype=numpy.int32)
-        for i, c in enumerate(comu):
-            H = G.subgraph(c)
-            h = list(H.nodes)
-            labels[h] = i
-        # labels = self.hdbscan_.fit_predict(X)
+        # X = rbf_kernel(data).astype(numpy.float64)
+        # print("[INFO] distances done.")
+        # # apply cut-ff
+        # print("[INFO] building sparse matrix.")
+        # X[X < 0.9] = 0
+        # X = csr_matrix(X)
+        # print("[INFO] sparse matrix done.")
+        # # labels = self.aff_prop_.fit_predict(data)
+        # print("[INFO] creating graph...")
+        # # G = nx.from_numpy_array(X)
+        # G = nx.from_scipy_sparse_array(X)
+        # G.edges(data=True)
+        # print("[INFO] Done creating graph.")
+
+        # print("[INFO] Detecting communities...")
+        # comu = nx.community.louvain_communities(G, seed=55, backend='parallel')
+        # print(f"[INFO] Louvain community detection yielded {len(comu)} communities.")
+
+        # labels = numpy.zeros(data.shape[0], dtype=numpy.int32)
+        # for i, c in enumerate(comu):
+        #     H = G.subgraph(c)
+        #     h = list(H.nodes)
+        #     labels[h] = i
+        labels = self.hdbscan_.fit_predict(data)
         return labels
 
     def elbow_kmeans(self, data, maxK=30, seed_centroids=None):
@@ -103,7 +104,7 @@ class ClusterFinder:
 
     def plot_clusters(self,
                       data: numpy.ndarray, labels: numpy.ndarray,
-                      prefix: str = None):
+                      prefix: Optional[str] = None):
         """ Plot clusters in 2-D space.
         """
         X = self.pca_.transform(data)
@@ -179,8 +180,8 @@ class ClusterFinder:
                     color_idx = klass % len(colors)
                     color = colors[color_idx]
                     Xk = X[labels == klass]
-                    points = numpy.asarray([Xk[:, x_dim], Xk[:, y_dim]]).T
-                    hull = ConvexHull(points)
+                    # points = numpy.asarray([Xk[:, x_dim], Xk[:, y_dim]]).T
+                    # hull = ConvexHull(points)
                     # for simplex in hull.simplices:
                     #    ax.plot(points[simplex, 0], points[simplex, 1], 'k-', lw=0.5, alpha=0.1)
                     ax.scatter(Xk[:, x_dim], Xk[:, y_dim], s=0.1, c=color, alpha=0.1)

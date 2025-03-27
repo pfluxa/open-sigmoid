@@ -1,5 +1,6 @@
 import copy
 import math
+from tqdm import tqdm
 
 import torch
 
@@ -62,11 +63,11 @@ class StochasticPool(torch.nn.Module):
 
         self.device_id_ = torch.device
 
-        self.target_postproc_ = StochasticPool.as_flat_tensor
+        self.target_postproc_ = StochasticPool.dummy # as_flat_tensor
         if self.task_ == 'classification':
             self.target_postproc_ = StochasticPool.onehot_to_ordinal
 
-        self.prediction_postproc_ = StochasticPool.as_flat_tensor
+        self.prediction_postproc_ = StochasticPool.dummy #as_flat_tensor
         if self.task_ == 'classification':
             self.prediction_postproc_ = StochasticPool.onehot_to_ordinal
 
@@ -137,7 +138,7 @@ class StochasticPool(torch.nn.Module):
         """
         self.autoencoder_ = ae_model
         for name, param in self.autoencoder_.named_parameters():
-            print(name)
+            # print(name)
             param.requires_grad = False
         self.autoencoder_.model_.to(self.device_id_)
 
@@ -175,7 +176,7 @@ class StochasticPool(torch.nn.Module):
                 invalid_idx.append(sidx)
                 continue
             msk = torch.where(bool_msk)[0].long()
-            e_in = torch.flatten(embeddings[msk, :], start_dim=1)
+            e_in = embeddings[msk, :]
             y_hat = self.skills_[sidx](e_in)
 
             y_list.append(y[msk, :])
@@ -196,8 +197,8 @@ class StochasticPool(torch.nn.Module):
         epoch_loss = 0.0
 
         for x_num, x_cat, y in data_loader:
-            # x_num = rearrange(x_num, 'r c -> c r')
-            x_cat = rearrange(x_cat, 'r c -> c r')
+            x_num = rearrange(x_num, 'r c -> c r')
+            # x_cat = rearrange(x_cat, 'r c -> c r')
             x_num = x_num.to(self.device_id_)
             x_cat = x_cat.to(self.device_id_)
             y = y.to(self.device_id_)
@@ -210,7 +211,8 @@ class StochasticPool(torch.nn.Module):
             loss = 0.0
             for i in range(0, self.ne_):
                 if i not in bad_idx:
-                    loss += self.s_loss_(y_hat_list[sidx], y_list[sidx])
+                    target = self.target_postproc_(y_list[sidx])
+                    loss += self.s_loss_(y_hat_list[sidx], target)
                     sidx += 1
             loss.backward()
             optimizer.step()
@@ -236,8 +238,8 @@ class StochasticPool(torch.nn.Module):
         eval_loss = 0.0
         with torch.no_grad():
             for x_num, x_cat, y in data_loader:
-                # x_num = rearrange(x_num, 'r c -> c r')
-                x_cat = rearrange(x_cat, 'r c -> c r')
+                x_num = rearrange(x_num, 'r c -> c r')
+                # x_cat = rearrange(x_cat, 'r c -> c r')
                 x_num = x_num.to(self.device_id_)
                 x_cat = x_cat.to(self.device_id_)
 
@@ -249,7 +251,8 @@ class StochasticPool(torch.nn.Module):
                 loss = 0.0
                 for i in range(0, self.ne_):
                     if i not in bad_idx:
-                        loss += self.s_loss_(y_hat_list[sidx], y_list[sidx])
+                        target = self.target_postproc_(y_list[sidx])
+                        loss += self.s_loss_(y_hat_list[sidx], target)
                         sidx += 1
                 eval_loss += loss.item()
 
@@ -302,9 +305,9 @@ class StochasticPool(torch.nn.Module):
         gt = []
         preds = []
         with torch.no_grad():
-            for x_num, x_cat, y in data_loader:
-                # x_num = rearrange(x_num, 'r c -> c r')
-                x_cat = rearrange(x_cat, 'r c -> c r')
+            for x_num, x_cat, y in tqdm(data_loader):
+                x_num = rearrange(x_num, 'r c -> c r')
+                # x_cat = rearrange(x_cat, 'r c -> c r')
                 x_num = x_num.to(self.device_id_)
                 x_cat = x_cat.to(self.device_id_)
                 y = y.to(self.device_id_)
@@ -316,7 +319,7 @@ class StochasticPool(torch.nn.Module):
                         predct = self.prediction_postproc_(y_hat_list[sidx])
                         preds.append(predct)
                         gt.append(target)
-                        print(predct.shape, target.shape)
+                        # print(predct.shape, target.shape)
                         sidx += 1
                 # routes.append(labels)
         predictions = torch.cat(preds).cpu().numpy()
