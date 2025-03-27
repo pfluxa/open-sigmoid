@@ -180,11 +180,11 @@ class ClusterFinder:
                     color_idx = klass % len(colors)
                     color = colors[color_idx]
                     Xk = X[labels == klass]
-                    # points = numpy.asarray([Xk[:, x_dim], Xk[:, y_dim]]).T
-                    # hull = ConvexHull(points)
-                    # for simplex in hull.simplices:
-                    #    ax.plot(points[simplex, 0], points[simplex, 1], 'k-', lw=0.5, alpha=0.1)
-                    ax.scatter(Xk[:, x_dim], Xk[:, y_dim], s=0.1, c=color, alpha=0.1)
+                    points = numpy.asarray([Xk[:, x_dim], Xk[:, y_dim]]).T
+                    hull = ConvexHull(points)
+                    for simplex in hull.simplices:
+                       ax.plot(points[simplex, 0], points[simplex, 1], 'k-', lw=0.5, alpha=0.1)
+                    ax.scatter(Xk[:, x_dim], Xk[:, y_dim], s=0.5, c=color, alpha=0.1)
             else:
                 ax.plot(X[labels == -1, x_dim], X[labels == -1, y_dim], "k+", alpha=0.01)
             ax.set_xlim(self.min_, self.max_)

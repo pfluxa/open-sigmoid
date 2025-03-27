@@ -94,7 +94,7 @@ if __name__ == '__main__':
 
     # E = 8
     B = 1024
-    N = 125000
+    N = 500000
     codec_dim = 5
     compute_device = torch.device('mps')
     torch.autograd.set_detect_anomaly(True)
@@ -183,7 +183,7 @@ if __name__ == '__main__':
     ae.to(compute_device)
 
     print("training autoencoder...")
-    ae.fit(train_loader, test_loader, n_epochs=1)
+    ae.fit(train_loader, test_loader, n_epochs=50)
     val_score = ae.evaluate(val_loader)
     print(f"MSE on validation set: {val_score:4.4e}")
 
