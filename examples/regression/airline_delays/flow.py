@@ -143,10 +143,9 @@ class Skill(torch.nn.Module):
 
 if __name__ == '__main__':
 
-    E = 64
-    B = 512
+    B = 4069
     N = 1000000
-    codec_dim = 8
+    codec_dim = 5
     compute_device = torch.device('cuda')
     #torch.autograd.set_detect_anomaly(True)
     tic = time.time()
@@ -187,16 +186,26 @@ if __name__ == '__main__':
 
     print("setting up dataloaders...")
     dataloader = StandardLoader(dataset)
-    train_loader = dataloader.get_loader("training", 0, batch_size=B)
+    train_loader = dataloader.get_loader("training", 0, batch_size=B, shuffle=True, num_workers=4)
     test_loader = dataloader.get_loader("testing", 0, batch_size=B, shuffle=False)
     val_loader = dataloader.get_loader("validation", 0, batch_size=B, shuffle=False)
-    clus_loader = dataloader.get_loader("clustering", 0, batch_size=B)
+    clus_loader = dataloader.get_loader("clustering", 0, batch_size=B, shuffle=False)
 
     # create model
-    print("setting up embedding model... ")
+    print("setting up autoencoder... ")
+
     idx_x_num = dataset.get_input_numerical_columns()
-    idx_x_cat = dataset.get_input_categorical_columns()
+    num_ranges = []
+    for idx in idx_x_num:
+        l, h = dataset.get_column_min_max(idx)
+        num_ranges.append((l, h))
+    depths = []
+    for idx, (l, h) in zip(idx_x_num, num_ranges):
+        dx = (h - l) / dataset.get_column_nunique_values(idx)
+        depths.append(int(-math.log2(dx)) + 1)
+
     cardinalities = dataset.get_cardinalities()
+
     parameters = {
         "decoder_dims": [
             {'in_dim': codec_dim, 'out_dim': 100},
@@ -206,24 +215,24 @@ if __name__ == '__main__':
         ],
         "codec_dim": codec_dim,
     }
-    model = Autoembedder(parameters)
-    model.build_embedding_layers(
-        len(idx_x_num),
+    emb_model = Autoembedder(parameters)
+    emb_model.build_embedding_layers(
+        num_ranges, depths,
         cardinalities
     )
-    model.build_autoencoder()
-    model.init_xavier_weights()
+    emb_model.build_num_encoder()
+    emb_model.build_cat_encoder()
+    emb_model.build_decoder()
 
-    print("setting up auto-encoder model... ")
     ae = AutoEmbedderWrapper(parameters)
-    ae.set_autoembedder(model)
+    ae.set_embedding_model(emb_model)
     ae.set_device(compute_device)
     # ae.set_kld_weight(B/N)
     # ae.set_kld_weight(0.0)
     ae.to(compute_device)
 
     print("training autoencoder...")
-    ae.fit(train_loader, test_loader, n_epochs=200)
+    ae.fit(train_loader, test_loader, n_epochs=50)
     val_score = ae.evaluate(val_loader)
     print(f"MSE on validation set: {val_score:4.4e}")
 
@@ -235,11 +244,10 @@ if __name__ == '__main__':
     # find clusters
     clusterer = ClusterFinder(
         min_samples=5,
-        min_cluster_size=5,
-        cluster_selection_method='leaf',
-        cluster_selection_epsilon=0.0,
+        min_cluster_size=20,
+        cluster_selection_method='eom',
+        cluster_selection_epsilon=0.01,
         n_jobs=12,
-        metric='euclidean'
     )
     test_labels = clusterer.find_clusters(test_encoded)
     # clusterer.elbow_kmeans(test_encoded)
@@ -255,7 +263,8 @@ if __name__ == '__main__':
         n_clusters -= 1
     print("number of clusters found:", n_clusters)
     if n_clusters == 0:
-        raise RuntimeError("[CRITICAL] No clusters found.")
+        print("[CRITICAL] No clusters found.")
+        n_clusters += 1
     noise_msk = labels == -1
     print(f"noisy samples = {numpy.sum(noise_msk)} total samples = {test_encoded.shape[0]}")
     labels = numpy.expand_dims(labels, axis=1)
@@ -264,7 +273,7 @@ if __name__ == '__main__':
 
     #create dummy data frame with synthetic labels
     col_names = []
-    for i in range(codec_dim):
+    for i in range(test_encoded.shape[1]):
         col_names.append(f'codec_{i}')
     codec_column_names = copy(col_names)
     col_names.append('clusterId')
@@ -305,7 +314,7 @@ if __name__ == '__main__':
     switch_test_loader = switch_loader.get_loader("testing", split_id=0, batch_size=B)
 
     # build and train switch
-    switch = FCSwitch(ae.get_n_input(), n_clusters)
+    switch = FCSwitch(codec_dim, n_clusters)
     switch.set_device(compute_device)
     switch.build()
     switch.fit(switch_train_loader, switch_test_loader, 50)
@@ -314,15 +323,14 @@ if __name__ == '__main__':
     scaler_dataset = MixedTypesAutoencoderDataset('./temp.h5', cache_all=True)
     scaler_dataset.toggle_return_y()
     scaler_loader = StandardLoader(scaler_dataset)
-    scaler_train_loader = scaler_loader.get_loader("training", split_id=1, shuffle=True, batch_size=B, num_workers=4)
-    scaler_test_loader = scaler_loader.get_loader("testing", split_id=1, shuffle=False, batch_size=B, num_workers=4)
-    scaler_val_loader = scaler_loader.get_loader("validation", split_id=1, shuffle=False, batch_size=1, num_workers=4)
+    scaler_train_loader = scaler_loader.get_loader("training", split_id=1, shuffle=True, batch_size=B)
+    scaler_test_loader = scaler_loader.get_loader("testing", split_id=1, shuffle=False, batch_size=B)
+    scaler_val_loader = scaler_loader.get_loader("validation", split_id=1, shuffle=False, batch_size=1)
 
     # build skill
     skill = Skill(ae.get_n_input(), 1)
     skill.to(compute_device)
 
-    # specialist = StochasticPool(ae, 'regression')
     specialist = StochasticPool('regression')
     specialist.set_device(compute_device)
     specialist.set_cooldown_scale(20)
@@ -330,7 +338,7 @@ if __name__ == '__main__':
     specialist.set_switch(switch)
     specialist.set_switch_balancing(switch_weights)
     # set specialist skill
-    specialist.set_skills(skill, n_clusters, torch.nn.MSELoss())
+    specialist.set_skills(skill, n_clusters, torch.nn.CrossEntropyLoss())
     specialist.set_skill_metric(MeanSquaredError)
     # train specialist
     specialist.fit(scaler_train_loader, scaler_test_loader, n_epochs=100)
