@@ -136,7 +136,7 @@ if __name__ == '__main__':
     )
     cache.load_column_types('/home/pedro/projects/open-sigmoid/data/transactions/column_types.json')
     cache.attach_column_transformation('isFraud', CategoricalAsOrdinal)
-    cache.attach_type_transformation('numerical', MinMaxTransform)
+    cache.attach_type_transformation('numerical', Passthrough)
     cache.attach_type_transformation('categorical', CategoricalAsOrdinal)
     cache.transform()
     cache.populate_metadata()

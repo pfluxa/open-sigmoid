@@ -134,7 +134,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
             reconstruction_loss = self.reconstruction_loss_(e_hat_num, e_num)
             reconstruction_loss += self.reconstruction_loss_(e_hat_cat, e_cat)
             # regularization_loss = sum(p.abs().sum() for p in self.parameters()) / n_params
-            loss = reconstruction_loss #+ sec_loss
+            loss = reconstruction_loss + sec_loss
             # update running (training) loss
             epoch_loss += loss.item()
             # adjust learning weights
@@ -170,7 +170,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
                 # print(f"mse loss = {reconstruction_loss:4.4E}")
                 # print(f"sec loss = {sec_loss:4.4E}")
                 # print(f"regularization loss = {regularization_loss:4.4E}")
-                loss = reconstruction_loss #+ sec_loss
+                loss = reconstruction_loss + sec_loss
                 # update running (testing) loss
                 testing_loss += loss.item()
                 # compute metrics
