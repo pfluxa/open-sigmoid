@@ -11,7 +11,7 @@ from torch import nn
 from typing import Dict, List, NamedTuple, Optional, Tuple
 from typing import Callable, Union, Any, TypeVar
 
-from sigmoid.nn.embeddings import NumericalEmbeddingPLE
+from sigmoid.nn.embeddings import ZIELEmbeddings
 from sigmoid.nn.embeddings import CategoricalEmbedding
 
 
@@ -55,16 +55,16 @@ class Autoembedder(nn.Module):
 
     def build_embedding_layers(
         self,
-        n_numerical_features: int,
-        mkbin_out: Dict[str, Any],
+        feature_ranges: List[Tuple[float, float]],
+        max_depths: List[int],
         cardinalities: List[int],
     ):
         """ Build the embedding layers.
         """
-        self.n_num_ = n_numerical_features
+        self.n_num_ = len(feature_ranges)
         self.n_cat_ = len(cardinalities)
         # numerical embedding
-        num_embeddings = NumericalEmbeddingPLE(n_numerical_features, **mkbin_out)
+        num_embeddings = ZIELEmbeddings(feature_ranges, max_depths)
         # categorical embeddings
         cat_embeddings = CategoricalEmbedding(cardinalities)
 
@@ -106,6 +106,7 @@ class Autoembedder(nn.Module):
                 hidden_dims[i]['out_dim'],
             )
             decoder_block.append(layer)
+        # decoder_block.append(nn.BatchNorm1d(hidden_dims[-1]['out_dim']))
         decoder = nn.Sequential(*decoder_block)
 
         self.num_unpooling_ = nn.Linear(hidden_dims[-1]['out_dim'], self.d_num_)
@@ -119,10 +120,10 @@ class Autoembedder(nn.Module):
         encoder_block = nn.TransformerEncoderLayer(
             d_model=self.d_cat_,
             nhead=1,
-            dim_feedforward=128,
+            dim_feedforward=512,
         )
         encoder = nn.TransformerEncoder(
-            encoder_block, num_layers=1,
+            encoder_block, num_layers=4,
             enable_nested_tensor=False
         )
 
@@ -135,10 +136,10 @@ class Autoembedder(nn.Module):
         encoder_block = nn.TransformerEncoderLayer(
             d_model=self.d_num_,
             nhead=1,
-            dim_feedforward=128,
+            dim_feedforward=512,
         )
         encoder = nn.TransformerEncoder(
-            encoder_block, num_layers=1,
+            encoder_block, num_layers=4,
             enable_nested_tensor=False
         )
 
@@ -162,43 +163,31 @@ class Autoembedder(nn.Module):
         Returns:
            torch.Tensor :Output of the 'Autoembedder'. It contains the concatenated and processed continues and categorical data.
         """
-        num_emb, num_key_msk = self.num_emb_(x_cont)
-        num_msk = self.num_src_mask_.clone().detach()
-        num_msk[:, mask_idx_num] = True
-        num_last_target = (num_emb.clone().detach())[mask_idx_num]
-
         cat_emb, cat_key_msk = self.cat_emb_(x_cat)
         cat_msk = self.cat_src_mask_.clone().detach()
-        cat_msk[:, mask_idx_cat] = True
+        cat_msk[mask_idx_cat] = True
         cat_last_target = (cat_emb.clone().detach())[mask_idx_cat]
 
-        # emb shape: B x n_features x embedding_dim
-        # we can take n_features = seq_length and
-        # create a mask that prevents tokens from
-        # attending to a particular one.
-        #
-        # according to docs
-        # [src/tgt/memory]_mask ensures that position i is allowed to
-        # attend the unmasked positions. If a BoolTensor is provided,
-        # positions with True are not allowed to attend while False
-        # values will be unchanged.
-        # column-wise masking
-        # m = rearrange(m, 'r c->c r')
-        # m[midx, :] = True
-        # m = rearrange(m, 'c r->r c')
-        # print("num emb shape:", num_emb.shape)
-        # print("num msk shape:", num_msk.shape)
-        # print("num msk key shape:", num_key_msk.shape)
-        num_h = self.num_encoder_(num_emb, mask=num_msk, src_key_padding_mask=num_key_msk)
-        num_h = rearrange(num_h, 's b n -> b s n')
-        num_z = self.num_pooling_(num_h)
+        num_emb, num_key_msk = self.num_emb_(x_cont)
+        num_msk = self.num_src_mask_.clone().detach()
+        num_msk[mask_idx_num] = True
+        num_last_target = (num_emb.clone().detach())[mask_idx_num]
 
         # print("cat emb shape:", cat_emb.shape)
         # print("cat msk shape:", cat_msk.shape)
         # print("cat msk key shape:", cat_key_msk.shape)
         cat_h = self.cat_encoder_(cat_emb, mask=cat_msk, src_key_padding_mask=cat_key_msk)
+        #print(cat_h[:, 0, :])
         cat_h = rearrange(cat_h, 's b n -> b s n')
         cat_z = self.cat_pooling_(cat_h)
+
+        # print("num emb shape:", num_emb.shape)
+        # print("num msk shape:", num_msk.shape)
+        # print("num msk key shape:", num_key_msk.shape)
+        num_h = self.num_encoder_(num_emb, mask=num_msk, src_key_padding_mask=num_key_msk)
+        # print(num_h[:, 0, :])
+        num_h = rearrange(num_h, 's b n -> b s n')
+        num_z = self.num_pooling_(num_h)
 
         z = num_z + cat_z
 

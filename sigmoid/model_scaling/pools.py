@@ -197,8 +197,8 @@ class StochasticPool(torch.nn.Module):
         epoch_loss = 0.0
 
         for x_num, x_cat, y in data_loader:
-            x_num = rearrange(x_num, 'r c -> c r')
-            # x_cat = rearrange(x_cat, 'r c -> c r')
+            # x_num = rearrange(x_num, 'r c -> c r')
+            x_cat = rearrange(x_cat, 'r c -> c r')
             x_num = x_num.to(self.device_id_)
             x_cat = x_cat.to(self.device_id_)
             y = y.to(self.device_id_)
@@ -238,8 +238,8 @@ class StochasticPool(torch.nn.Module):
         eval_loss = 0.0
         with torch.no_grad():
             for x_num, x_cat, y in data_loader:
-                x_num = rearrange(x_num, 'r c -> c r')
-                # x_cat = rearrange(x_cat, 'r c -> c r')
+                # x_num = rearrange(x_num, 'r c -> c r')
+                x_cat = rearrange(x_cat, 'r c -> c r')
                 x_num = x_num.to(self.device_id_)
                 x_cat = x_cat.to(self.device_id_)
 
@@ -306,8 +306,8 @@ class StochasticPool(torch.nn.Module):
         preds = []
         with torch.no_grad():
             for x_num, x_cat, y in tqdm(data_loader):
-                x_num = rearrange(x_num, 'r c -> c r')
-                # x_cat = rearrange(x_cat, 'r c -> c r')
+                # x_num = rearrange(x_num, 'r c -> c r')
+                x_cat = rearrange(x_cat, 'r c -> c r')
                 x_num = x_num.to(self.device_id_)
                 x_cat = x_cat.to(self.device_id_)
                 y = y.to(self.device_id_)

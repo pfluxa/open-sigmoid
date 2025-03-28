@@ -73,7 +73,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
 
         n_num = self.model_.d_num_
         n_cat = self.model_.d_cat_
-        
+
         return n_num + n_cat
 
     def get_encodings(self) -> torch.Tensor:
@@ -87,7 +87,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
         n = self.last_target_num_
         c = self.last_target_cat_
         z = torch.cat([n, c], dim=1)
-        
+
         return z
 
     def forward(self, x_cont: torch.Tensor, x_cat: torch.Tensor):
@@ -102,7 +102,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
             mask_idx_num=idx_num,
             mask_idx_cat=idx_cat,
         )
-        
+
         self.last_target_num_ = lt_num
         self.last_target_cat_ = lt_cat
 
@@ -121,8 +121,8 @@ class AutoEmbedderWrapper(torch.nn.Module):
         self.model_.train(True)
         epoch_loss = 0.0
         for x_num, x_cat in tqdm(dataloader):
-            x_num = rearrange(x_num, 'r c -> c r')
-            # x_cat = rearrange(x_cat, 'r c -> c r')
+            # x_num = rearrange(x_num, 'r c -> c r')
+            x_cat = rearrange(x_cat, 'r c -> c r')
             x_num = x_num.to(self.compute_device_)
             x_cat = x_cat.to(self.compute_device_)
 
@@ -154,8 +154,8 @@ class AutoEmbedderWrapper(torch.nn.Module):
 
         with torch.no_grad():
             for x_num, x_cat in tqdm(dataloader):
-                x_num = rearrange(x_num, 'r c -> c r')
-                # x_cat = rearrange(x_cat, 'r c -> c r')
+                # x_num = rearrange(x_num, 'r c -> c r')
+                x_cat = rearrange(x_cat, 'r c -> c r')
                 x_num = x_num.to(self.compute_device_)
                 x_cat = x_cat.to(self.compute_device_)
                 # run autoencoder on batch
@@ -198,8 +198,8 @@ class AutoEmbedderWrapper(torch.nn.Module):
         self.cat_metric_.reset()
         with torch.no_grad():
             for x_num, x_cat in tqdm(dataloader):
-                x_num = rearrange(x_num, 'r c -> c r')
-                # x_cat = rearrange(x_cat, 'r c -> c r')
+                # x_num = rearrange(x_num, 'r c -> c r')
+                x_cat = rearrange(x_cat, 'r c -> c r')
                 x_num = x_num.to(self.compute_device_)
                 x_cat = x_cat.to(self.compute_device_)
                 # run autoencoder on batch
@@ -215,7 +215,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
                     torch.flatten(e_hat_cat, start_dim=1),
                     torch.flatten(e_cat, start_dim=1)
                 )
-        mse_loss = self.num_metric_.compute() + self.cat_metric_.compute() 
+        mse_loss = self.num_metric_.compute() + self.cat_metric_.compute()
         mse_loss = torch.sqrt(mse_loss) / 2.0
 
         return mse_loss
@@ -228,8 +228,8 @@ class AutoEmbedderWrapper(torch.nn.Module):
         self.eval()
         with torch.no_grad():
             for x_num, x_cat in tqdm(dataloader):
-                x_num = rearrange(x_num, 'r c -> c r')
-                # x_cat = rearrange(x_cat, 'r c -> c r')
+                # x_num = rearrange(x_num, 'r c -> c r')
+                x_cat = rearrange(x_cat, 'r c -> c r')
                 x_num = x_num.to(self.compute_device_)
                 x_cat = x_cat.to(self.compute_device_)
                 self(x_num, x_cat)
@@ -266,8 +266,8 @@ class AutoEmbedderWrapper(torch.nn.Module):
         logline += "{test_loss:+04.4e},"
         logline += "{mse:+04.4e},"
 
-        # optimizer = Adam(self.parameters(), lr=1E-3) # capturable=True)
-        optimizer = SGD(self.parameters(), lr=1E-3, momentum=1e-5) # capturable=True)
+        optimizer = Adam(self.parameters(), lr=1E-3) # capturable=True)
+        # optimizer = SGD(self.parameters(), lr=1E-4, momentum=1e-7) # capturable=True)
         lr_scheduler = ExponentialLR(optimizer, 0.99)
         # lr_scheduler = ReduceLROnPlateau(optimizer,
         #     mode='min',
@@ -291,7 +291,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
             logline += "train loss = " + f"{train_loss:4.4e}".zfill(5) + ", "
             logline += "test loss = " + f"{test_loss:4.4e}".zfill(5) + ", "
             logline += "num mse = " + f"{self.metric_['num'][epoch]:4.4e}".zfill(5) + ", "
-            logline += "cat mse = " + f"{self.metric_['num'][epoch]:4.4e}".zfill(5) + ", "
+            logline += "cat mse = " + f"{self.metric_['cat'][epoch]:4.4e}".zfill(5) + ", "
             logline += "LR = " + f"{lr_scheduler.get_last_lr()[-1]:4.4e}".zfill(5)
             # remove trailing comma
             logline = logline[:-1]
@@ -315,5 +315,3 @@ class AutoEmbedderWrapper(torch.nn.Module):
                 # training_log['reconstruction_error'].append(self.get_test_mse(epoch))
 
         return training_log
-
-    

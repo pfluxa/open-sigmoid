@@ -1,3 +1,4 @@
+from os import getcwd
 import time
 import time
 import json
@@ -21,7 +22,9 @@ from sigmoid.preprocessing.dataloaders import StandardLoader
 # column transforms
 # from sigmoid.preprocessing.transformations import Passthrough
 # from sigmoid.preprocessing.transformations import MinMaxTransform
-from sigmoid.preprocessing.transformations import MinMaxTransform, Passthrough, QuantileTransform
+from sigmoid.preprocessing.transformations import MinMaxTransform
+from sigmoid.preprocessing.transformations import Passthrough
+from sigmoid.preprocessing.transformations import QuantileTransform
 from sigmoid.preprocessing.transformations import CategoricalAsOrdinal
 from sigmoid.preprocessing.transformations import CategoricalAsOneHot
 # models
@@ -93,14 +96,14 @@ def read_data(path, nrows: int):
 if __name__ == '__main__':
 
     # E = 8
-    B = 1024
+    B = 4096
     N = 500000
     codec_dim = 5
-    compute_device = torch.device('mps')
+    compute_device = torch.device('cuda')
     torch.autograd.set_detect_anomaly(True)
     tic = time.time()
 
-    data_path = '/Users/pfluxa/projects/open-sigmoid/data/transactions/data.csv'
+    data_path = '/home/pedro/projects/open-sigmoid/data/transactions/data.csv'
     # read, transform and write raw data into cache
     data_frame, n_true, n_false = read_data(data_path, nrows=N)
     # create local cache
@@ -131,7 +134,7 @@ if __name__ == '__main__':
                       'transactionDateTime_year'
                     ]
     )
-    cache.load_column_types('/Users/pfluxa/projects/open-sigmoid/data/transactions/column_types.json')
+    cache.load_column_types('/home/pedro/projects/open-sigmoid/data/transactions/column_types.json')
     cache.attach_column_transformation('isFraud', CategoricalAsOrdinal)
     cache.attach_type_transformation('numerical', MinMaxTransform)
     cache.attach_type_transformation('categorical', CategoricalAsOrdinal)
@@ -146,17 +149,26 @@ if __name__ == '__main__':
 
     print("setting up dataloaders...")
     dataloader = StandardLoader(dataset)
-    train_loader = dataloader.get_loader("training", 0, batch_size=B, shuffle=True)
+    train_loader = dataloader.get_loader("training", 0, batch_size=B, shuffle=True, num_workers=4)
     test_loader = dataloader.get_loader("testing", 0, batch_size=B, shuffle=False)
     val_loader = dataloader.get_loader("validation", 0, batch_size=B, shuffle=False)
     clus_loader = dataloader.get_loader("clustering", 0, batch_size=B, shuffle=False)
 
     # create model
     print("setting up autoencoder... ")
+
     idx_x_num = dataset.get_input_numerical_columns()
-    n_x_num = len(idx_x_num)
-    mkbin_out = PLE.mkbins(cache.x_data_.to_numpy()[:, idx_x_num])
+    num_ranges = []
+    for idx in idx_x_num:
+        l, h = dataset.get_column_min_max(idx)
+        num_ranges.append((l, h))
+    depths = []
+    for idx, (l, h) in zip(idx_x_num, num_ranges):
+        dx = (h - l) / dataset.get_column_nunique_values(idx)
+        depths.append(int(-math.log2(dx)) + 1)
+
     cardinalities = dataset.get_cardinalities()
+
     parameters = {
         "decoder_dims": [
             {'in_dim': codec_dim, 'out_dim': 100},
@@ -168,7 +180,7 @@ if __name__ == '__main__':
     }
     emb_model = Autoembedder(parameters)
     emb_model.build_embedding_layers(
-        n_x_num, mkbin_out,
+        num_ranges, depths,
         cardinalities
     )
     emb_model.build_num_encoder()
@@ -249,7 +261,7 @@ if __name__ == '__main__':
     for col_name in codec_column_names:
         column_types[col_name] = 'numerical'
     column_types['clusterId'] = 'categorical'
-    with open('/Users/pfluxa/projects/open-sigmoid/data/transactions/encoded_data_types.json', 'w', encoding='utf-8') as f:
+    with open('/home/pedro/projects/open-sigmoid/data/transactions/encoded_data_types.json', 'w', encoding='utf-8') as f:
         json.dump(column_types, f, ensure_ascii=False, indent=4)
 
     data_enc = numpy.concatenate([test_encoded, labels], axis=1)
@@ -265,7 +277,7 @@ if __name__ == '__main__':
 
     # setup cache to train switch
     switch_cache = Cache(switch_dataframe, 'clusterId', ignore=[])
-    switch_cache.load_column_types('/Users/pfluxa/projects/open-sigmoid/data/transactions/encoded_data_types.json')
+    switch_cache.load_column_types('/home/pedro/projects/open-sigmoid/data/transactions/encoded_data_types.json')
     switch_cache.attach_type_transformation('categorical', CategoricalAsOneHot)
     switch_cache.transform()
     switch_cache.populate_metadata()

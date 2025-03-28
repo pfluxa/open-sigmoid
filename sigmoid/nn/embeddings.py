@@ -6,6 +6,8 @@
 #  file: tabtransformertf/models/embeddings.py
 #
 # Modified by P. Fluxá (Thoughtworks Chile SPA, 2025)
+# = better performance of PLE by decoupling binning from layer creation
+# - addition of "in house" encoding scheme (ZIEL)
 #
 #-----------------------------------------------------------------------------
 from typing import List, Tuple, Union, Any, Dict
@@ -19,6 +21,95 @@ from einops import rearrange
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
+
+
+class ZIELEmbeddings(nn.Module):
+
+    def __init__(self,
+                 feature_ranges: List[Tuple[float, float]],
+                 max_depths: List[int]):
+        """
+        Vectorized binary encoder with padding to max depth
+
+        Args:
+            feature_ranges: List of (min, max) tuples for each feature
+            max_depths: Either single int or list of ints per feature
+        """
+        super().__init__()
+
+        self.min_emb_dim_ = max([0, min(max_depths)])
+        self.max_emb_dim_ = max([0, max(max_depths)])
+
+        # Convert to tensors
+        self.feature_ranges = torch.tensor(feature_ranges, dtype=torch.float32)
+        self.n_features = len(feature_ranges)
+
+        self.max_depths = torch.tensor(max_depths, dtype=torch.long)
+
+        # Determine padding
+        self.max_depth = self.max_depths.max().item()
+        self.total_tokens = self.n_features * self.max_depth
+
+        # Register buffers
+        self.register_buffer('depth_mask', self._create_depth_mask())
+
+    def _create_depth_mask(self) -> torch.Tensor:
+        """Create mask for valid tokens (1=real, 0=padding)"""
+        mask = torch.zeros(self.n_features, self.max_depth, dtype=torch.bool)
+        for i, depth in enumerate(self.max_depths):
+            mask[i, :depth] = 1
+        return mask
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch_size, n_features)
+
+        Returns:
+            Padded token tensor of shape (batch_size, n_features, max_depth)
+            with -1 for padding positions
+        """
+        batch_size = x.shape[0]
+        device = x.device
+
+        # Initialize bounds [B, F]
+        mins = self.feature_ranges[:, 0].expand(batch_size, -1).to(device)
+        maxs = self.feature_ranges[:, 1].expand(batch_size, -1).to(device)
+        lows = mins.clone()
+        highs = maxs.clone()
+
+        # Prepare output tensor with padding
+        tokens = torch.full((batch_size, self.n_features, self.max_depth),
+                          -1, dtype=torch.long, device=device)
+
+        # Vectorized encoding
+        for depth in range(self.max_depth):
+            # Only process features that need this depth
+            active = depth < self.max_depths.to(device)
+            active_mask = active.unsqueeze(0)  # [1, F]
+
+            # Compute decisions for active features
+            mids = (lows + highs) / 2
+            decisions = ((x >= mids) & active_mask).byte()  # [B, F]
+
+            # Store tokens
+            tokens[:, :, depth] = torch.where(
+                active_mask,
+                decisions,
+                torch.tensor(-1, dtype=torch.long, device=device)
+            )
+
+            # Update bounds
+            lows = torch.where(active_mask & (decisions == 1), mids, lows)
+            highs = torch.where(active_mask & (decisions == 0), mids, highs)
+
+        tokens = rearrange(tokens, 'b f d -> f b d')
+        padding_mask = (tokens == -1).bool()
+        padding_mask = rearrange(padding_mask, 'f b d-> b f d')[:, :, 0]
+        tokens = tokens.float()
+
+        return tokens, padding_mask
+
 
 class PLE(nn.Module):
 
@@ -35,7 +126,6 @@ class PLE(nn.Module):
         for x in data:
             # use Freedman-Diaconis rule
             iqr = np.subtract(*np.percentile(x, [75, 25]))
-            print(iqr)
             bw = 2.0 * iqr / np.cbrt(len(x))
             nb = int(np.ceil((x.max() - x.min()) / bw))
             dx = 1.0 / nb
@@ -131,9 +221,9 @@ class NumericalEmbeddingPLE(nn.Module):
         for i, layer in enumerate(self.embedding_layers_):
             embeddings.append(layer(x[i]))
         padded_emb_tensor = pad_sequence(embeddings, padding_value=self.padval_)
-        padded_emb_tensor = rearrange(padded_emb_tensor, 'n s b -> s b n')
+        padded_emb_tensor = rearrange(padded_emb_tensor, 'd s b -> s b d')
         padding_mask = padded_emb_tensor == self.padval_
-        padding_mask = rearrange(padding_mask, 's b n-> b s n')[:, :, 0]
+        padding_mask = rearrange(padding_mask, 's b d-> b s d')[:, :, 0]
 
         return padded_emb_tensor, padding_mask
 
@@ -145,32 +235,41 @@ class CategoricalEmbedding(nn.Module):
     def __init__(
         self,
         cardinalities: List[int],
-        min_emb_dim: int = 2048,
         max_emb_dim: int = -1,
+        min_emb_dim: int = 1000000,
     ):
         super(CategoricalEmbedding, self).__init__()
         # compute min/max embedding dimensions
-        self.min_emb_dim_ = min([min_emb_dim, min(cardinalities) + 1])
-        self.max_emb_dim_ = max([max_emb_dim, max(cardinalities) + 1])
+        self.min_emb_dim_ = min([
+            min_emb_dim,
+            int(math.ceil(min(cardinalities)**0.5) + 1)])
+        self.max_emb_dim_ = max([
+            max_emb_dim,
+            int(math.ceil(max(cardinalities)**0.5) + 1)])
 
         assert self.min_emb_dim_ > 0, "Minimum embedding dimension must be positive"
 
         self.embedding_layers_ = nn.ModuleList()
         for c in cardinalities:
-            self.embedding_layers_.append(nn.Embedding(c, c + 1))
+            d = int(math.ceil(c**0.5) + 1)
+            self.embedding_layers_.append(
+                nn.Sequential(
+                    nn.Embedding(c, d),
+                    nn.LayerNorm(d),
+                )
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """ x: categorical data with shape (n_categories, batch_size)
         """
         embeddings = []
         for i, layer in enumerate(self.embedding_layers_):
-            emb = rearrange(layer(x[:, i]), 'b c -> c b')
-            # emb = layer(x[i])
+            emb = rearrange(layer(x[i]), 'b d -> d b')
             embeddings.append(emb)
         padded_emb_tensor = pad_sequence(embeddings, padding_value=self.padval_)
-        padding_mask = padded_emb_tensor == self.padval_
         padded_emb_tensor = rearrange(padded_emb_tensor, 'd s b -> s b d')
-        padding_mask = rearrange(padding_mask, 'd s b-> b s d')[:, :, 0]
+        padding_mask = padded_emb_tensor == self.padval_
+        padding_mask = rearrange(padding_mask, 's b d-> b s d')[:, :, 0]
 
         return padded_emb_tensor, padding_mask
 
@@ -194,6 +293,26 @@ class PositionalEncoding(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.pe[:, :x.size(1), :]
         return x
+
+def test_zeil_embedding():
+
+    # Config - 3 features with different depths
+    feature_ranges = [(0.0, 1.0), (-1.0, 1.0), (0.0, 100.0)]
+    max_depths = [4, 6, 3]  # Max depth = 6
+
+    # Create encoder on GPU
+    encoder = ZIELEmbeddings(feature_ranges, max_depths).cuda()
+
+    # Sample batch
+    batch_size = 7
+    r1 = torch.linspace(0, 2, batch_size)[None, :]
+    r2 = torch.linspace(-1, 1, batch_size)[None, :]
+    r3 = torch.linspace(-1, 105, batch_size)[None, :]
+    batch = torch.cat([r1, r2, r3], dim=0).t().float().cuda()
+    # Encode
+    tokens, padding_mask = encoder(batch)
+
+    return tokens, padding_mask
 
 def test_numericalPLE_embedding(use_cuda: bool = False):
 
@@ -225,15 +344,18 @@ def test_numericalPLE_embedding(use_cuda: bool = False):
 
 def test_categorical_embedding(use_cuda: bool = False):
 
-    cat_emb = CategoricalEmbedding([4, 6, 8])
+    cat_emb = CategoricalEmbedding([4, 37, 199])
     if use_cuda:
         cat_emb.cuda()
     t = np.asarray([
         [0, 3, 5],
         [1, 0, 7],
+        [0, 1, 3],
         [2, 5, 2],
+        [3, 4, 6],
+        [3, 4, 6],
         [3, 4, 6]]
-    )
+    ) # batch size = 7
     y = torch.tensor(t).t()
     if use_cuda:
         y = y.cuda()
@@ -252,15 +374,17 @@ if __name__ == "__main__":
         print(mc)
         print("-" * 79 + '\n')
 
-        zn, mn = test_numericalPLE_embedding()
+        # zn, mn = test_numericalPLE_embedding()
+        # print("-" * 79)
+        # print(zn.shape)
+        # print(zn)
+        # print(mn)
+        # print("-" * 79 + '\n')
+
+        zn, mn = test_zeil_embedding()
         print("-" * 79)
         print(zn.shape)
+        print(mn.shape)
         print(zn)
         print(mn)
         print("-" * 79 + '\n')
-        # print(zc.shape)
-        # z = torch.cat([zn, zc], dim=1)
-        # pos_enc = PositionalEncoding(16)
-        # zp = pos_enc(z)
-
-        # print(zp.shape)

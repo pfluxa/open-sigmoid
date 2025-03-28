@@ -751,6 +751,28 @@ class MixedTypesAutoencoderDataset(torch_Dataset):
 
         return split_idx
 
+    def get_column_min_max(self, column_idx: int) -> tuple:
+        """ Returns minimum and maximum values for a given column.
+        """
+        if self.all_cached_:
+            min_val = self.x_data[:, column_idx].min()
+            max_val = self.x_data[:, column_idx].max()
+        else:
+            min_val = self.h5file_['x'][:, column_idx].min()
+            max_val = self.h5file_['x'][:, column_idx].max()
+
+        return min_val, max_val
+
+    def get_column_nunique_values(self, column_idx: int) ->int:
+        """ Returns unique values for a given column.
+        """
+        if self.all_cached_:
+            unique_values = numpy.unique(self.x_data[:, column_idx])
+        else:
+            unique_values = numpy.unique(self.h5file_['x'][:, column_idx])
+
+        return len(unique_values.tolist())
+
     def get_input_dim(self) -> int:
         """ Returns number of features in X data.
         """
