@@ -113,9 +113,9 @@ class ClusterFinder:
 
         plt.figure(figsize=(5 * 3, 2 * 5))
         G = gridspec.GridSpec(2, 3)
-        ax11 = plt.subplot(G[0, 0])
-        ax12 = plt.subplot(G[0, 1])
-        ax13 = plt.subplot(G[0, 2])
+        ax11 = plt.subplot(G[0, 0], projection='3d')
+        ax12 = plt.subplot(G[0, 1], projection='3d')
+        ax13 = plt.subplot(G[0, 2], projection='3d')
 
         ax21 = plt.subplot(G[1, 0])
         ax22 = plt.subplot(G[1, 1])
@@ -126,6 +126,7 @@ class ClusterFinder:
             'axis': ax11,
             'x_dim': 0,
             'y_dim': 1,
+            'z_dim': 2,
             'clustered': True,
             'proj': 'xy'
             },
@@ -133,6 +134,7 @@ class ClusterFinder:
             'axis': ax12,
             'x_dim': 0,
             'y_dim': 2,
+            'z_dim': 1,
             'clustered': True,
             'proj': 'xz'
             },
@@ -140,6 +142,7 @@ class ClusterFinder:
             'axis': ax13,
             'x_dim': 1,
             'y_dim': 2,
+            'z_dim': 0,
             'clustered': True,
             'proj': 'yz'
             },
@@ -147,6 +150,7 @@ class ClusterFinder:
             'axis': ax21,
             'x_dim': 0,
             'y_dim': 1,
+            'z_dim': 2,
             'clustered': False,
             'proj': 'xy'
             },
@@ -154,6 +158,7 @@ class ClusterFinder:
             'axis': ax22,
             'x_dim': 0,
             'y_dim': 2,
+            'z_dim': 1,
             'clustered': False,
             'proj': 'xz'
             },
@@ -161,6 +166,7 @@ class ClusterFinder:
             'axis': ax23,
             'x_dim': 1,
             'y_dim': 2,
+            'z_dim': 0,
             'clustered': False,
             'proj': 'yz'
             },
@@ -170,29 +176,29 @@ class ClusterFinder:
             ax.set_aspect('equal')
             x_dim = plot_info['x_dim']
             y_dim = plot_info['y_dim']
+            # z_dim = plot_info['z_dim']
             is_clustered = plot_info['clustered']
-
-            if is_clustered:
-                colors = ["g", "r", "b", "y", "c"]
-                for klass in numpy.unique(labels):
-                    if klass == -1:
-                        continue
-                    color_idx = klass % len(colors)
-                    color = colors[color_idx]
-                    Xk = X[labels == klass]
-                    points = numpy.asarray([Xk[:, x_dim], Xk[:, y_dim]]).T
-                    hull = ConvexHull(points)
-                    for simplex in hull.simplices:
-                       ax.plot(points[simplex, 0], points[simplex, 1], 'k-', lw=0.5, alpha=0.1)
-                    ax.scatter(Xk[:, x_dim], Xk[:, y_dim], s=0.5, c=color, alpha=0.1)
-            else:
-                ax.plot(X[labels == -1, x_dim], X[labels == -1, y_dim], "k+", alpha=0.01)
+            colors = ["g", "r", "b", "y", "c"]
+            for klass in numpy.unique(labels):
+                if klass == -1:
+                    continue
+                color_idx = klass % len(colors)
+                color = colors[color_idx]
+                Xk = X[labels == klass]
+                # points = numpy.asarray([Xk[:, x_dim], Xk[:, y_dim]]).T
+                # hull = ConvexHull(points)
+                # for simplex in hull.simplices:
+                #    ax.plot(points[simplex, 0], points[simplex, 1], 'k-', lw=0.5, alpha=0.1)
+                if is_clustered:
+                    ax.scatter(Xk[:, 0], Xk[:, 1], Xk[:, 2], s=0.5, c=color, alpha=0.1)
+                else:
+                    ax.scatter(X[labels == -1, x_dim], X[labels == -1, y_dim], c=color, alpha=0.1)
             ax.set_xlim(self.min_, self.max_)
             ax.set_ylim(self.min_, self.max_)
-            if is_clustered:
-                ax.set_title(f"proj = {plot_info['proj']}")
-            else:
-                ax.set_title(f"proj = {plot_info['proj']} (noise)")
+            # if is_clustered:
+            ax.set_title(f"proj = {plot_info['proj']}")
+            # else:
+            #    ax.set_title(f"proj = {plot_info['proj']} (noise)")
 
         plt.tight_layout()
         if prefix is not None:

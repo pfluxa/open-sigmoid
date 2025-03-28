@@ -41,7 +41,7 @@ class MultiprocessLoader(torch_DataLoader):
             in order, that is, following the original index.
         """
         loader = None
-        if num_workers > 0 and num_workers is not None:
+        if num_workers is not None:
             loader = torch_DataLoader(
                 self.dataset_,
                 num_workers=num_workers,
@@ -144,12 +144,19 @@ class StandardLoader(torch_DataLoader):
             split_idx = self.dataset_.get_split(split_type, split_id, read=True)
             split_dataset = Subset(self.dataset_, split_idx.tolist())
         
-        loader = torch_DataLoader(
-            split_dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            drop_last=False)
+        if num_workers is None: 
+            loader = torch_DataLoader(
+                split_dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                drop_last=False)
+        else:
+            loader = torch_DataLoader(
+                split_dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                drop_last=False)
 
         return loader
         

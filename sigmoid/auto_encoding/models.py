@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.optim import Adam, SGD
-from torcheval.metrics import MeanSquaredError
+from torcheval.metrics import MeanSquaredError, BinaryAccuracy
 
 from sigmoid.nn.utils import GracefulExiter
 
@@ -28,11 +28,12 @@ class AutoEmbedderWrapper(torch.nn.Module):
 
         self.config_ = config
         self.model_ = nn.Module()
-        self.reconstruction_loss_ = torch.nn.MSELoss(reduction='mean')
+        self.reconstruction_loss1_ = torch.nn.BCELoss(reduction='mean')
+        self.reconstruction_loss2_ = torch.nn.MSELoss(reduction='mean')
         self.metric_ = {}
         self.metric_['num'] = []
         self.metric_['cat'] = []
-        self.num_metric_ = MeanSquaredError()
+        self.num_metric_ = BinaryAccuracy()
         self.cat_metric_ = MeanSquaredError()
         self.seed_ = 42
         self.compute_device_ = torch.device
@@ -108,6 +109,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
 
         self.code_value_ = ct
 
+
         return x_num, x_cat, sec_l
 
     def train_single_epoch(self,
@@ -118,8 +120,10 @@ class AutoEmbedderWrapper(torch.nn.Module):
 
             @param
         """
+        b = 0
         self.model_.train(True)
         epoch_loss = 0.0
+        # for x_num, x_cat in dataloader:
         for x_num, x_cat in tqdm(dataloader):
             # x_num = rearrange(x_num, 'r c -> c r')
             x_cat = rearrange(x_cat, 'r c -> c r')
@@ -127,12 +131,21 @@ class AutoEmbedderWrapper(torch.nn.Module):
             x_cat = x_cat.to(self.compute_device_)
 
             optimizer.zero_grad()
-            e_hat_num, e_hat_cat, sec_loss = self(x_num, x_cat)
-            e_num = self.last_target_num_
-            e_cat = self.last_target_cat_
-
-            reconstruction_loss = self.reconstruction_loss_(e_hat_num, e_num)
-            reconstruction_loss += self.reconstruction_loss_(e_hat_cat, e_cat)
+            
+            e_hat_num_padded, e_hat_cat_padded, sec_loss = self(x_num, x_cat)
+            e_num_padded = self.last_target_num_
+            e_cat_padded = self.last_target_cat_
+            
+            # handle padding
+            num_msk = e_num_padded[0] > 1
+            cat_msk = e_cat_padded[0] < 0
+            e_num = e_num_padded[:, ~num_msk]
+            e_cat = e_cat_padded[:, ~cat_msk]
+            e_hat_num = e_hat_num_padded[:, ~num_msk]
+            e_hat_cat = e_hat_cat_padded[:, ~cat_msk]
+             
+            reconstruction_loss = self.reconstruction_loss1_(e_hat_num, e_num)
+            reconstruction_loss += self.reconstruction_loss2_(e_hat_cat, e_cat)
             # regularization_loss = sum(p.abs().sum() for p in self.parameters()) / n_params
             loss = reconstruction_loss + sec_loss
             # update running (training) loss
@@ -141,6 +154,8 @@ class AutoEmbedderWrapper(torch.nn.Module):
             loss.backward()
             # update uptimizer
             optimizer.step()
+            
+            b = b + 1
         self.model_.train(False)
 
         return epoch_loss
@@ -158,29 +173,33 @@ class AutoEmbedderWrapper(torch.nn.Module):
                 x_cat = rearrange(x_cat, 'r c -> c r')
                 x_num = x_num.to(self.compute_device_)
                 x_cat = x_cat.to(self.compute_device_)
-                # run autoencoder on batch
-                # x_emb_hat, kld_loss, h_loss = self(x_num, x_cat)
-                e_hat_num, e_hat_cat, sec_loss = self(x_num, x_cat)
-                e_num = self.last_target_num_
-                e_cat = self.last_target_cat_
-
-                reconstruction_loss = self.reconstruction_loss_(e_hat_num, e_num)
-                reconstruction_loss += self.reconstruction_loss_(e_hat_cat, e_cat)
-                # regularization_loss = sum(p.abs().sum() for p in self.parameters()) / n_params
-                # print(f"mse loss = {reconstruction_loss:4.4E}")
-                # print(f"sec loss = {sec_loss:4.4E}")
-                # print(f"regularization loss = {regularization_loss:4.4E}")
+                
+                e_hat_num_padded, e_hat_cat_padded, sec_loss = self(x_num, x_cat)
+                e_num_padded = self.last_target_num_
+                e_cat_padded = self.last_target_cat_
+                
+                # handle padding
+                num_msk = e_num_padded[0] > 1
+                cat_msk = e_cat_padded[0] < 0
+                e_num = e_num_padded[:, ~num_msk]
+                e_cat = e_cat_padded[:, ~cat_msk]
+                e_hat_num = e_hat_num_padded[:, ~num_msk]
+                e_hat_cat = e_hat_cat_padded[:, ~cat_msk]
+                
+                reconstruction_loss = self.reconstruction_loss1_(e_hat_num, e_num)
+                reconstruction_loss += self.reconstruction_loss2_(e_hat_cat, e_cat)
+                
                 loss = reconstruction_loss + sec_loss
-                # update running (testing) loss
                 testing_loss += loss.item()
+                
                 # compute metrics
                 self.num_metric_.update(
-                    torch.flatten(e_hat_num, start_dim=1),
-                    torch.flatten(e_num, start_dim=1)
+                    torch.flatten(e_hat_num, start_dim=0),
+                    torch.flatten(e_num, start_dim=0)
                 )
                 self.cat_metric_.update(
-                    torch.flatten(e_hat_cat, start_dim=1),
-                    torch.flatten(e_cat, start_dim=1)
+                    torch.flatten(e_hat_cat, start_dim=0),
+                    torch.flatten(e_cat, start_dim=0)
                 )
             # print('-' * 89)
             # print(x_emb_hat[0])
@@ -203,22 +222,31 @@ class AutoEmbedderWrapper(torch.nn.Module):
                 x_num = x_num.to(self.compute_device_)
                 x_cat = x_cat.to(self.compute_device_)
                 # run autoencoder on batch
-                # x_emb_hat, kld_loss, h_loss = self(x_num, x_cat)
-                e_hat_num, e_hat_cat, _ = self(x_num, x_cat)
-                e_num = self.last_target_num_
-                e_cat = self.last_target_cat_
+                e_hat_num_padded, e_hat_cat_padded, _ = self(x_num, x_cat)
+                e_num_padded = self.last_target_num_
+                e_cat_padded = self.last_target_cat_
+                
+                # handle padding
+                num_msk = e_num_padded[0] > 1
+                cat_msk = e_cat_padded[0] < 0
+                e_num = e_num_padded[:, ~num_msk]
+                e_cat = e_cat_padded[:, ~cat_msk]
+                e_hat_num = e_hat_num_padded[:, ~num_msk]
+                e_hat_cat = e_hat_cat_padded[:, ~cat_msk]
+                
+                # compute metrics
                 self.num_metric_.update(
-                    torch.flatten(e_hat_num, start_dim=1),
-                    torch.flatten(e_num, start_dim=1)
+                    torch.flatten(e_hat_num, start_dim=0),
+                    torch.flatten(e_num, start_dim=0)
                 )
                 self.cat_metric_.update(
-                    torch.flatten(e_hat_cat, start_dim=1),
-                    torch.flatten(e_cat, start_dim=1)
+                    torch.flatten(e_hat_cat, start_dim=0),
+                    torch.flatten(e_cat, start_dim=0)
                 )
-        mse_loss = self.num_metric_.compute() + self.cat_metric_.compute()
-        mse_loss = torch.sqrt(mse_loss) / 2.0
+        num_rec_loss = self.num_metric_.compute()
+        cat_rec_loss = self.cat_metric_.compute()
 
-        return mse_loss
+        return num_rec_loss, cat_rec_loss
 
     def encode_data(self, dataloader: DataLoader, max_samples: int = -1) -> torch.Tensor:
         """ Encode data from DataLoader.
@@ -290,7 +318,7 @@ class AutoEmbedderWrapper(torch.nn.Module):
             logline += "time = " + f"{(toc - tic):4.4f}".zfill(5) + " seconds, "
             logline += "train loss = " + f"{train_loss:4.4e}".zfill(5) + ", "
             logline += "test loss = " + f"{test_loss:4.4e}".zfill(5) + ", "
-            logline += "num mse = " + f"{self.metric_['num'][epoch]:4.4e}".zfill(5) + ", "
+            logline += "num acc = " + f"{self.metric_['num'][epoch]:4.4e}".zfill(5) + ", "
             logline += "cat mse = " + f"{self.metric_['cat'][epoch]:4.4e}".zfill(5) + ", "
             logline += "LR = " + f"{lr_scheduler.get_last_lr()[-1]:4.4e}".zfill(5)
             # remove trailing comma

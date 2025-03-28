@@ -92,6 +92,7 @@ class Autoembedder(nn.Module):
                 self.codec_dim_
             ),
         )
+        self.codec_pooling_ = nn.Linear(2 * self.codec_dim_, self.codec_dim_)
 
     def build_decoder(self):
         """
@@ -104,12 +105,15 @@ class Autoembedder(nn.Module):
             layer = nn.Linear(
                 hidden_dims[i]['in_dim'],
                 hidden_dims[i]['out_dim'],
+                bias=False
             )
             decoder_block.append(layer)
-        # decoder_block.append(nn.BatchNorm1d(hidden_dims[-1]['out_dim']))
         decoder = nn.Sequential(*decoder_block)
 
-        self.num_unpooling_ = nn.Linear(hidden_dims[-1]['out_dim'], self.d_num_)
+        self.num_unpooling_ = nn.Sequential(
+            nn.Linear(hidden_dims[-1]['out_dim'], self.d_num_),
+            nn.Sigmoid()
+        )
         self.cat_unpooling_ = nn.Linear(hidden_dims[-1]['out_dim'], self.d_cat_)
         self.decoder_ = decoder
 
@@ -189,7 +193,8 @@ class Autoembedder(nn.Module):
         num_h = rearrange(num_h, 's b n -> b s n')
         num_z = self.num_pooling_(num_h)
 
-        z = num_z + cat_z
+        z_nc = torch.cat([num_z, cat_z], dim=1)
+        z = self.codec_pooling_(z_nc)
 
         sec_loss = self.spherical_embedding_loss(z)
         code_value = z.clone().detach()
@@ -208,8 +213,10 @@ class Autoembedder(nn.Module):
 
         xn = x.norm(p=2, dim=1)
         xn_mean = xn.mean().detach()
+        self.norm_mean_ = xn_mean
+        xn_var = xn.var()
         l_sec = xn - xn_mean
-        l_sec = (l_sec * l_sec).sum() / x.shape[0]
+        l_sec = (torch.sqrt(xn_var + l_sec * l_sec)).mean()# / x.shape[0]
 
         return l_sec
 

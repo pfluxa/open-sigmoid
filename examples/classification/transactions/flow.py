@@ -28,7 +28,6 @@ from sigmoid.preprocessing.transformations import QuantileTransform
 from sigmoid.preprocessing.transformations import CategoricalAsOrdinal
 from sigmoid.preprocessing.transformations import CategoricalAsOneHot
 # models
-from sigmoid.nn.embeddings import PLE
 from sigmoid.nn.embedders import Autoembedder
 from sigmoid.auto_encoding.models import AutoEmbedderWrapper
 # switch
@@ -96,14 +95,14 @@ def read_data(path, nrows: int):
 if __name__ == '__main__':
 
     # E = 8
-    B = 4096
-    N = 500000
+    B = 512
+    N = 65536 * 4
     codec_dim = 5
-    compute_device = torch.device('cuda')
-    torch.autograd.set_detect_anomaly(True)
+    compute_device = torch.device('cpu') #mps')
+    # torch.autograd.set_detect_anomaly(True)
     tic = time.time()
 
-    data_path = '/home/pedro/projects/open-sigmoid/data/transactions/data.csv'
+    data_path = '/Users/pfluxa/projects/open-sigmoid/data/transactions/data.csv'
     # read, transform and write raw data into cache
     data_frame, n_true, n_false = read_data(data_path, nrows=N)
     # create local cache
@@ -134,9 +133,9 @@ if __name__ == '__main__':
                       'transactionDateTime_year'
                     ]
     )
-    cache.load_column_types('/home/pedro/projects/open-sigmoid/data/transactions/column_types.json')
+    cache.load_column_types('/Users/pfluxa/projects/open-sigmoid/data/transactions/column_types.json')
     cache.attach_column_transformation('isFraud', CategoricalAsOrdinal)
-    cache.attach_type_transformation('numerical', Passthrough)
+    cache.attach_type_transformation('numerical', MinMaxTransform)
     cache.attach_type_transformation('categorical', CategoricalAsOrdinal)
     cache.transform()
     cache.populate_metadata()
@@ -149,8 +148,8 @@ if __name__ == '__main__':
 
     print("setting up dataloaders...")
     dataloader = StandardLoader(dataset)
-    train_loader = dataloader.get_loader("training", 0, batch_size=B, shuffle=True, num_workers=4)
-    test_loader = dataloader.get_loader("testing", 0, batch_size=B, shuffle=False)
+    train_loader = dataloader.get_loader("training", 0, batch_size=B, shuffle=True, num_workers=None)
+    test_loader = dataloader.get_loader("testing", 0, batch_size=B, shuffle=False, num_workers=None)
     val_loader = dataloader.get_loader("validation", 0, batch_size=B, shuffle=False)
     clus_loader = dataloader.get_loader("clustering", 0, batch_size=B, shuffle=False)
 
@@ -160,21 +159,21 @@ if __name__ == '__main__':
     idx_x_num = dataset.get_input_numerical_columns()
     num_ranges = []
     for idx in idx_x_num:
-        l, h = dataset.get_column_min_max(idx)
-        num_ranges.append((l, h))
+        low, high = dataset.get_column_min_max(idx)
+        num_ranges.append((low, high))
     depths = []
-    for idx, (l, h) in zip(idx_x_num, num_ranges):
-        dx = (h - l) / dataset.get_column_nunique_values(idx)
+    for idx, (low, high) in zip(idx_x_num, num_ranges):
+        dx = (high - low) / dataset.get_column_nunique_values(idx)
         depths.append(int(-math.log2(dx)) + 1)
 
     cardinalities = dataset.get_cardinalities()
 
     parameters = {
         "decoder_dims": [
-            {'in_dim': codec_dim, 'out_dim': 100},
-            {'in_dim': 100, 'out_dim': 1000},
-            {'in_dim': 1000, 'out_dim': 1000},
-            {'in_dim': 1000, 'out_dim': 100},
+            {'in_dim': codec_dim, 'out_dim': 50},
+            {'in_dim': 50, 'out_dim': 500},
+            {'in_dim': 500, 'out_dim': 500},
+            {'in_dim': 500, 'out_dim': 50},
         ],
         "codec_dim": codec_dim,
     }
@@ -196,8 +195,10 @@ if __name__ == '__main__':
 
     print("training autoencoder...")
     ae.fit(train_loader, test_loader, n_epochs=50)
-    val_score = ae.evaluate(val_loader)
-    print(f"MSE on validation set: {val_score:4.4e}")
+    val_scores = ae.evaluate(val_loader)
+    
+    print(f"numerical reconstruction score on validation set: {val_scores[0]:4.4e}")
+    print(f"categorical reconstruction score on validation set: {val_scores[1]:4.4e}")
 
     # encode clustering set
     test_encoded = ae.encode_data(clus_loader)
@@ -261,7 +262,7 @@ if __name__ == '__main__':
     for col_name in codec_column_names:
         column_types[col_name] = 'numerical'
     column_types['clusterId'] = 'categorical'
-    with open('/home/pedro/projects/open-sigmoid/data/transactions/encoded_data_types.json', 'w', encoding='utf-8') as f:
+    with open('/Users/pfluxa/projects/open-sigmoid/data/transactions/encoded_data_types.json', 'w', encoding='utf-8') as f:
         json.dump(column_types, f, ensure_ascii=False, indent=4)
 
     data_enc = numpy.concatenate([test_encoded, labels], axis=1)
@@ -277,7 +278,7 @@ if __name__ == '__main__':
 
     # setup cache to train switch
     switch_cache = Cache(switch_dataframe, 'clusterId', ignore=[])
-    switch_cache.load_column_types('/home/pedro/projects/open-sigmoid/data/transactions/encoded_data_types.json')
+    switch_cache.load_column_types('/Users/pfluxa/projects/open-sigmoid/data/transactions/encoded_data_types.json')
     switch_cache.attach_type_transformation('categorical', CategoricalAsOneHot)
     switch_cache.transform()
     switch_cache.populate_metadata()
